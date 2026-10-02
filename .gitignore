@@ -1,0 +1,15 @@
+.signing/
+build/
+Backups/
+dist/
+launch-video*/node_modules
+launch-video*/out/
+launch-video*/public/fonts/
+launch-video*/public/*.mp3
+site/check.cjs
+.DS_Store
+# Marketing drafts stay local
+site/
+landing-claude/
+launch-video/
+launch-video-opus/
