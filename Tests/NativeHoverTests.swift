@@ -26,6 +26,7 @@ import SwiftUI
         precondition(!visibility.visible, "leaving the bar fades it again")
         visibility.start()
         precondition(!visibility.visible, "content refreshes must not reveal idle bars")
+        precondition(visibility.opacity == 0, "idle content must emit no pixels, including strips positioned over app windows")
         visibility.setHovered(true); visibility.setHovered(false); visibility.cancel()
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.08))
         precondition(visibility.visible, "removed views cancel pending fade callbacks")

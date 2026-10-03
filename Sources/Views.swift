@@ -228,7 +228,7 @@ struct BoardView: View {
                 Button { manager.onSwitcher?() } label: { Image(systemName: "rectangle.bottomthird.inset.filled").foregroundStyle(muted) }.buttonStyle(.plain).help("Show the floating lane switcher")
                 Button { manager.showGrid() } label: { Image(systemName: "viewfinder").foregroundStyle(muted) }.buttonStyle(.plain).help("Show the lane boundaries on your display")
             }
-            if manager.gridDraft != nil {
+            if manager.gridDraft != nil && manager.presetPreview == nil {
                 HStack(spacing: 10) {
                     Image(systemName: "pencil").foregroundStyle(accent)
                     Text("You changed the grid. Nothing on your screen has changed yet.").font(.system(size: 11))

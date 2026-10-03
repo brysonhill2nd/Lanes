@@ -98,7 +98,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     private var editingDraft = false
     var grid: Settings { editingDraft ? settings : (gridDraft ?? settings) }
     var gridLanes: [Lane] { grid.enabledLanes }
-    private var snapshot: [String: SavedWindow] = [:]
+    private(set) var snapshot: [String: SavedWindow] = [:]
     private var overrides: [String: Lane] = [:]
     @Published var activeIDs: [Lane: String] = [:]
     private var managedIDs: Set<String> = []
@@ -141,7 +141,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     // the window you were working in.
     var isBoardVisible: (() -> Bool)?
     var onKeepBoard: (() -> Void)?
-    var startedInBoard: Bool { NSApp.isActive && (isBoardVisible?() ?? false) }
+    var startedInBoard: Bool { NSApp?.isActive == true && (isBoardVisible?() ?? false) }
     var onOverlay: (([(Lane, CGRect)]) -> Void)?
     private let settingsURL: URL
 
@@ -401,6 +401,9 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         else if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(url) }
     }
     func refresh(silent: Bool = false, restorePopulatedCategories: Bool = false) {
+        // An edit works against a temporary copy of settings and window state.
+        // Discovery belongs to the applied grid, so defer it until after Apply.
+        guard !editingDraft else { return }
         refreshRunningApps()
         trusted = AXIsProcessTrusted()
         recordPermissionState()
@@ -482,7 +485,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         for window in outsideGrid where !window.minimized && NSRunningApplication(processIdentifier: window.pid)?.isHidden != true {
             guard StrayWindow.coversGrid(window.frame, regions: regions) else { continue }
             let target = NewWindowCenter.frame(for: window.frame.size, in: screenFrame, gap: settings.gap)
-            if !TabSwitch.sameSpot(target, window.frame), move(window.element, to: target) { moved += 1 }
+            if !TabSwitch.sameSpot(target, window.frame), movePreservingOriginal(window, to: target) { moved += 1 }
         }
         return moved
     }
@@ -623,10 +626,18 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     }
     func capture(_ window: ManagedWindow) {
         if hiddenAppSnapshot[window.pid] == nil { hiddenAppSnapshot[window.pid] = NSRunningApplication(processIdentifier: window.pid)?.isHidden ?? false }
-        if snapshot[window.id] == nil, let frame = axFrame(window.element) {
-            snapshot[window.id] = SavedWindow(element: window.element, frame: frame, minimized: axBool(window.element, kAXMinimizedAttribute))
+        if snapshot[window.id] == nil {
+            // Discovery already read the original frame. Preserve it even if a
+            // fresh AX read temporarily fails immediately before moving it.
+            let frame = axFrame(window.element) ?? window.frame
+            let minimized = (axValue(window.element, kAXMinimizedAttribute) as? Bool) ?? window.minimized
+            snapshot[window.id] = SavedWindow(element: window.element, frame: frame, minimized: minimized)
             canUndo = true
         }
+    }
+    @discardableResult func movePreservingOriginal(_ window: ManagedWindow, to frame: CGRect) -> Bool {
+        capture(window)
+        return move(window.element, to: frame)
     }
     @discardableResult func move(_ element: AXUIElement, to frame: CGRect) -> Bool {
         var position = frame.origin, size = frame.size
@@ -642,9 +653,11 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         return fits
     }
     func autoOrganize(hideBoard: Bool = true, forceAutoLayout: Bool = false) {
-        guard !busy else { return }
+        guard !busy, !editingDraft else { return }
+        guard trusted else { status = "Enable window control to arrange your apps."; return }
         let stay = startedInBoard
         let working = rememberWorkingWindow()
+        guard commitPendingGrid() else { return }
         let previousSelections = Array(activeIDs.values)
         refresh(silent: true, restorePopulatedCategories: forceAutoLayout || !settings.useCustomGrid)
         guard trusted else { status = "macOS has not recognized window access for this Lanes build. Open Access help to repair its permission entry."; return }
@@ -694,30 +707,43 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     }
     @Published var presetPreview: PresetPreview?
     func previewPreset(_ shape: PresetShape) {
-        gridDraft = nil
-        let lanes = enabledLanes
+        let lanes = gridLanes
         let counts = Dictionary(uniqueKeysWithValues: lanes.map { ($0, items($0).count) })
         let main = lanes.contains(selectedLane) ? selectedLane : lanes.first ?? .terminal
         presetPreview = PresetPreview(name: shape.title, lanes: lanes, rects: shape.rects(lanes: lanes, main: main, windows: counts), savedID: nil, shape: shape)
     }
     func previewSavedLayout(_ layout: SavedGridLayout) {
-        gridDraft = nil
         presetPreview = PresetPreview(name: layout.name, lanes: layout.lanes.compactMap(Lane.init(rawValue:)), rects: layout.rects, savedID: layout.id, shape: nil)
     }
     func applyPresetPreview() {
-        guard let preview = presetPreview else { return }
+        guard presetPreview != nil, commitPendingGrid() else { return }
+        if trusted { arrange(hideBoard: false) } else { onLaneControls?() }
+    }
+    // Every Apply/Organize entry point commits the same visible grid first.
+    // Merely previewing a preset retains the draft underneath it for Cancel.
+    @discardableResult func commitPendingGrid() -> Bool {
+        let preview = presetPreview
+        if let preview {
+            guard GridGeometry.valid(preview.rects, lanes: preview.lanes) else {
+                status = "This preset does not fit your categories."; return false
+            }
+            if let id = preview.savedID, !settings.savedLayouts.contains(where: { $0.id == id }) {
+                status = "This preset is no longer available."; return false
+            }
+        }
+        commitGridDraft()
+        guard let preview else { return true }
         presetPreview = nil
         if let id = preview.savedID, let layout = settings.savedLayouts.first(where: { $0.id == id }) {
             loadGridLayout(layout)
         } else {
-            guard GridGeometry.valid(preview.rects, lanes: enabledLanes) else { status = "This preset does not fit your categories."; return }
             settings.previousLayout = currentGridLayout(name: "Previous layout")
             let before = layoutRects()
             rememberLayout(); settings.customRects = preview.rects
             recenterMovedStrips(changedFrom: before)
             layoutChanged("\(preview.name) applied.")
         }
-        if trusted && canUndo { arrange(hideBoard: false) } else { onLaneControls?() }
+        return true
     }
     // The tour of the Lanes window: shown once on first launch, and again on request.
     @Published var tourStep: Int?
@@ -753,6 +779,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     func arrange(hideBoard: Bool = true) {
         guard !editingDraft else { return }
         guard trusted else { status = "Enable window control to arrange your apps."; return }
+        guard commitPendingGrid() else { return }
         let stay = startedInBoard
         busy = true
         refresh(silent: true)
@@ -1152,6 +1179,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     // Lanes window, or disappears if it matches what is applied.
     func editGrid(_ body: () -> Void) {
         guard !editingDraft else { body(); return }
+        presetPreview = nil
         let live = settings
         let state = (windows, outsideGrid, overrides, visibleSlotIDs, activeIDs, activeSlot, pages)
         let laneControls = onLaneControls, hide = onHide
@@ -1168,25 +1196,46 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     }
     static func sameGrid(_ a: Settings, _ b: Settings) -> Bool {
         a.enabledLanes == b.enabledLanes && a.customCategories == b.customCategories && a.categoryNames == b.categoryNames &&
+            a.windowCategories == b.windowCategories && a.placedWindows == b.placedWindows && a.placements == b.placements && a.gap == b.gap &&
             a.enabledLanes.allSatisfy { a.unitRect(for: $0) == b.unitRect(for: $0) && a.capacity($0) == b.capacity($0) }
     }
     // Apply: the draft becomes the grid your screen uses, and windows are arranged into it.
     func applyGridDraft() {
+        guard gridDraft != nil, commitPendingGrid() else { return }
+        if trusted { arrange(hideBoard: false) } else { onLaneControls?(); status = "Grid saved. Enable window control to arrange your apps." }
+    }
+    private func commitGridDraft() {
         guard let draft = gridDraft else { return }
         gridDraft = nil
         let before = layoutRects()
+        let previous = currentGridLayout(name: "Previous layout")
+        let chosen = Dictionary(uniqueKeysWithValues: enabledLanes.compactMap { lane in activeWindow(lane).map { (lane, $0.id) } })
         settings.apply(draft.displayLayout(kind: .wide))
         recenterMovedStrips(changedFrom: before)
         settings.customCategories = draft.customCategories
         settings.categoryNames = draft.categoryNames
         settings.windowCategories = draft.windowCategories
-        settings.previousLayout = draft.previousLayout
+        settings.previousLayout = previous
         settings.placements = draft.placements
+        settings.placedWindows = draft.placedWindows
+        settings.gap = draft.gap
         overrides = settings.windowCategories.compactMapValues(Lane.init(rawValue:))
-        save(); refresh(silent: true)
+        // Draft editing intentionally restores the live slot state. Apply must
+        // now normalize it for the new count without losing the chosen pane.
+        for lane in enabledLanes {
+            let capacity = settings.capacity(lane)
+            let ids = items(lane).map(\.id)
+            var slots = WindowSlots.normalized(visibleSlotIDs[lane] ?? [], ids: ids, capacity: capacity)
+            if let id = chosen[lane], ids.contains(id) {
+                let target = min(activeSlot[lane] ?? 0, capacity - 1)
+                slots = WindowSlots.replacing(slots, with: id, at: target)
+                activeIDs[lane] = id
+                activeSlot[lane] = slots.firstIndex(of: id) ?? target
+            }
+            visibleSlotIDs[lane] = slots
+        }
+        save()
         if !enabledLanes.contains(selectedLane), let first = enabledLanes.first { selectedLane = first }
-        if trusted && canUndo { arrange(hideBoard: false) } else { onLaneControls?() }
-        status = "Grid applied."
     }
     // A strip you dragged keeps its spot only while its category's box stays the
     // same; when the box changes, the strip goes back to the middle of its top edge.
@@ -1305,15 +1354,25 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         } else { restoreCategory(lane, at: CGPoint(x: point.x / size.width, y: point.y / size.height)) }
         return enabledLanes.contains(lane)
     }
-    func currentGridLayout(name: String) -> SavedGridLayout {
-        SavedGridLayout(name: name, rects: layoutRects(), capacities: settings.capacities, lanes: enabledLanes.map(\.rawValue), gap: settings.gap, categories: settings.customCategories, categoryNames: settings.categoryNames, windowCategories: settings.windowCategories)
+    func currentGridLayout(name: String, from source: Settings? = nil) -> SavedGridLayout {
+        let source = source ?? settings
+        let rects = Dictionary(uniqueKeysWithValues: source.enabledLanes.map { ($0.rawValue, ZoneRect(source.unitRect(for: $0))) })
+        return SavedGridLayout(name: name, rects: rects, capacities: source.capacities, lanes: source.enabledLanes.map(\.rawValue), gap: source.gap, categories: source.customCategories, categoryNames: source.categoryNames, windowCategories: source.windowCategories)
     }
     @discardableResult func saveGridLayout(name input: String) -> Bool {
         let name = String(input.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60))
         guard !name.isEmpty else { return false }
         var uniqueName = name; var suffix = 2
         while settings.savedLayouts.contains(where: { $0.name == uniqueName }) { uniqueName = "\(name) \(suffix)"; suffix += 1 }
-        settings.savedLayouts.append(currentGridLayout(name: uniqueName)); save()
+        var layout = currentGridLayout(name: uniqueName, from: grid)
+        if let preview = presetPreview {
+            if let id = preview.savedID, let saved = settings.savedLayouts.first(where: { $0.id == id }) {
+                layout = saved; layout.id = UUID().uuidString; layout.name = uniqueName
+            } else {
+                layout.rects = preview.rects; layout.lanes = preview.lanes.map(\.rawValue)
+            }
+        }
+        settings.savedLayouts.append(layout); save()
         status = "\(uniqueName) saved with category sizes and windows shown at once."
         return true
     }

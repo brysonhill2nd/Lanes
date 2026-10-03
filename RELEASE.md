@@ -23,7 +23,7 @@ Keychain items are unreadable while the screen is locked, and the first `codesig
 2. Run the checks: `./test.sh`
 3. Build, sign, notarize and staple: `./release.sh`
 
-   It finds your Developer ID certificate on its own and ends with `Ready to publish: dist/Lanes-<version>.dmg`. Without the certificate it makes a local-only build and says so; do not publish that one.
+   The disk image opens to a window with Lanes, an arrow and Applications (layout in `Tools/dmg-settings.py`, background drawn by `Tools/render-dmg-background.swift`). It finds your Developer ID certificate on its own and ends with `Ready to publish: dist/Lanes-<version>.dmg`. Without the certificate it makes a local-only build and says so; do not publish that one.
 4. Check it the way a stranger would: copy the disk image to another Mac (or another user account), open it, drag Lanes to Applications and open it. macOS should show only the normal "downloaded from the internet" question.
 5. Publish it: `gh release create v<version> dist/Lanes-<version>.dmg --title "Lanes <version>" --notes "…"`, and update the version in README.md.
 

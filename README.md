@@ -6,7 +6,7 @@ A native macOS menu bar organizer for an ultrawide desktop. Organize discovers y
 
 Lanes is free. It needs macOS 14 or later and runs on Apple Silicon and Intel Macs.
 
-1. Download `Lanes-1.0.0.dmg` from [Releases](https://github.com/brysonhill2nd/Lanes/releases/latest), open it, and drag **Lanes** into **Applications**.
+1. Download the latest Lanes disk image from [Releases](https://github.com/brysonhill2nd/Lanes/releases/latest), open it, and drag **Lanes** into **Applications**.
 2. Open Lanes. Its icon appears in the menu bar and the Lanes window opens.
 3. Click **Open System Settings** and switch Lanes on. macOS asks once, because Lanes moves other apps' windows. Lanes notices within a few seconds.
 4. Click **Organize**, or tap **Right Command twice**.
@@ -54,7 +54,7 @@ After arranging, each category has a strip above its desktop windows. Preference
 
 A category with only one window has no strip, since there is nothing to switch to; the strip returns when a second window joins.
 
-**Strip position** (Preferences) chooses where strips sit. **On the windows** (the default) centers each strip on the top edge of its category and gives windows the full height, with no padding. Drag a strip's ≡ handle to put it anywhere; Lanes remembers the spot per category, keeps it on screen, and moves it with the category when the grid is resized. Right-click a strip → **Move strip back to the top edge**, or use **Reset positions**. Strips on the windows fade to a faint outline instead of disappearing, so you never click an invisible strip. **Above the windows** keeps the previous reserved band.
+**Strip position** (Preferences) chooses where strips sit. **On the windows** (the default) centers each strip on the top edge of its category and gives windows the full height, with no padding. Drag a strip's ≡ handle to put it anywhere; Lanes remembers the spot per category, keeps it on screen, and moves it with the category when the grid is resized. Right-click a strip → **Move strip back to the top edge**, or use **Reset positions**. Both positions fade fully transparent when idle and reappear when you hover their saved position. **Above the windows** reserves a band above the app windows.
 
 - Hover a strip and **scroll** to cycle that category.
 - While hovered, bare **Left/Right** cycles backward/forward; **1–9** selects tabs 1–9 and **0** selects tab 10. Numbers follow the saved queue order. These keys are registered only while hovered, then released on exit, removal, or opening the board for editing. Modified app shortcuts are preserved.
@@ -67,7 +67,7 @@ Each grid region has a **window count** menu in its top-right corner: choose 1�
 
 ## Saved layouts and split regions
 
-**Save as preset…** stores your own preset: a named layout with category positions, sizes, active categories, spacing and simultaneous window counts. Your presets appear in the same row as the built-in ones, preview the same way, and survive restart. Duplicate names create a separate numbered copy. Right-click one of your presets to delete it. Trying any preset first saves the current grid; **Back to previous layout** restores it, even after restarting. **Undo grid edit** also reverses resizing, window counts and splitting. Preset selection edits the grid preview; click Apply this grid or Organize to apply it.
+**Save as preset…** stores the grid you are editing, including unsaved category positions, sizes, active categories, spacing and simultaneous window counts. Saving leaves your desktop alone. Your presets appear in the same row as the built-in ones, preview the same way, and survive restart. Duplicate names create a separate numbered copy. Right-click one of your presets to delete it. Trying presets keeps your unsaved edits underneath; Cancel returns to them. **Apply**, **Apply this grid**, and **Organize** commit the displayed draft or preset before arranging windows. Applying a preset preserves the prior edited grid in **Back to previous layout**, even after restarting. **Undo grid edit** also reverses resizing, window counts and splitting.
 
 Select a category and use the **Split** scissors button, or its context menu, to split left/right or top/bottom. The second region is independently named (for example Browser 2), movable and resizable. If another window is available, it is moved into that region; existing two-pane groups become two independent regions. Split again for more places. Assignments for the same still-open windows survive restarting Lanes.
 
@@ -130,7 +130,7 @@ Automatic placement is off by default. With **Place new windows in their categor
 
 ## Build and check
 
-Needs macOS 14 or later and the Xcode command-line tools (`xcode-select --install`). No packages to download.
+Needs macOS 14 or later and the Xcode command-line tools (`xcode-select --install`). Building and testing download nothing; the first `./release.sh` installs [dmgbuild](https://pypi.org/project/dmgbuild/) into `build/` to lay out the disk image window.
 
 ```sh
 ./build.sh        # quick Apple Silicon build in build/Lanes.app

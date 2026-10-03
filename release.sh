@@ -44,11 +44,13 @@ fi
 codesign --verify --deep --strict $APP
 
 print "Packing $DMG…"
-staging=build/release/dmg
-rm -rf $staging && mkdir -p $staging
-cp -R $APP $staging/
-ln -s /Applications $staging/Applications
-hdiutil create -quiet -volname "Lanes $VERSION" -srcfolder $staging -ov -format UDZO $DMG
+# dmgbuild lays out the window: Lanes on the left, an arrow, Applications on the right.
+if [[ ! -x build/dmgbuild-venv/bin/dmgbuild ]]; then
+  python3 -m venv build/dmgbuild-venv
+  build/dmgbuild-venv/bin/pip install --quiet dmgbuild==1.6.7
+fi
+xcrun swift -module-cache-path build/module-cache Tools/render-dmg-background.swift build/release/dmg
+build/dmgbuild-venv/bin/dmgbuild -s Tools/dmg-settings.py -D app=$APP -D background=build/release/dmg/background.png -D volume_icon=$APP/Contents/Resources/Lanes.icns "Lanes" $DMG
 
 if (( DISTRIBUTABLE )); then
   codesign --force --timestamp --sign "$IDENTITY" $DMG

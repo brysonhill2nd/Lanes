@@ -7,7 +7,6 @@ struct LaneWindowStrip: NSViewRepresentable {
     let showBoard: () -> Void
     func makeNSView(context: Context) -> LaneScrollHostingView {
         let view = LaneScrollHostingView(rootView: AnyView(Color.clear))
-        view.visibility.floor = manager.settings.stripPlacement == .onWindows ? 0.35 : 0
         view.setStripContent(AnyView(LanePickerContent(manager: manager, lane: lane, showBoard: showBoard)))
         view.onSwitch = { delta in manager.cycleWindow(lane, delta: delta) }
         view.onHover = { active in
@@ -18,7 +17,6 @@ struct LaneWindowStrip: NSViewRepresentable {
         return view
     }
     func updateNSView(_ view: LaneScrollHostingView, context: Context) {
-        view.visibility.floor = manager.settings.stripPlacement == .onWindows ? 0.35 : 0
         view.setStripContent(AnyView(LanePickerContent(manager: manager, lane: lane, showBoard: showBoard)))
         view.onSwitch = { delta in manager.cycleWindow(lane, delta: delta) }
         view.onHover = { active in

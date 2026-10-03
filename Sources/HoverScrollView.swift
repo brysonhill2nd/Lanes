@@ -5,8 +5,6 @@ import AppKit
 // transparent strip remains a stable hover target and emits no idle pixels.
 final class StripVisibility: ObservableObject {
     @Published private(set) var opacity = 1.0
-    // Lowest idle opacity. Strips drawn over windows stay faintly visible.
-    @Published var floor = 0.0
     var visible: Bool { opacity > 0 }
     private var fadeTimer: Timer?
     private var pending: DispatchWorkItem?
@@ -46,7 +44,7 @@ struct FadingStripContent: View {
     @ObservedObject var visibility: StripVisibility
     let content: AnyView
     var body: some View {
-        content.opacity(max(visibility.floor, visibility.opacity))
+        content.opacity(visibility.opacity)
     }
 }
 

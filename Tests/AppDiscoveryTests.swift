@@ -152,6 +152,7 @@ import ApplicationServices
         drafts.discardGridDraft()
         precondition(drafts.gridDraft == nil && drafts.grid.unitRect(for: a) == rectA, "Discard leaves everything as it was")
         drafts.editGrid { drafts.removeCategory(b) }
+        precondition(!drafts.trusted, "draft refreshes cannot re-enable window operations in an isolated fixture")
         precondition(drafts.enabledLanes.contains(b) && !drafts.gridLanes.contains(b), "removing a category waits for Apply")
         drafts.editGrid { drafts.restoreCategory(b) }
         drafts.editGrid { drafts.swapCategories(a, b) }
@@ -167,6 +168,70 @@ import ApplicationServices
         precondition(drafts.settings.stripPositions[a.rawValue] == nil, "a dragged strip goes back to the middle when its category's box changes")
         precondition(drafts.settings.unitRect(for: a) == rectB && (try! Data(contentsOf: draftFile)) != savedBefore, "Apply saves the new grid")
         print("PASS: grid edits stay a draft until Apply")
+
+        let pending = WindowManager(settingsFile: fixture.appendingPathComponent("pending.json"), startPolling: false)
+        pending.trusted = false
+        let originalCount = pending.settings.capacity(.terminal)
+        let originalRect = pending.settings.unitRect(for: .terminal)
+        pending.editGrid { pending.setCapacity(.terminal, 4); pending.swapCategories(.terminal, .browser) }
+        let editedRect = pending.grid.unitRect(for: .terminal)
+        precondition(pending.saveGridLayout(name: "Draft preset"))
+        let savedDraft = pending.settings.savedLayouts.last!
+        precondition(savedDraft.capacities["terminal"] == 4 && savedDraft.rects["terminal"]?.cgRect == editedRect, "saving a draft uses the visible counts and geometry")
+        precondition(pending.settings.capacity(.terminal) == originalCount && pending.settings.unitRect(for: .terminal) == originalRect, "saving a draft must not arrange or apply it")
+        pending.previewPreset(PresetShape.allCases[0])
+        pending.previewPreset(PresetShape.allCases[1])
+        let shapeRects = pending.presetPreview!.rects
+        precondition(pending.saveGridLayout(name: "Visible preview"))
+        precondition(pending.settings.savedLayouts.last!.rects == shapeRects && pending.settings.savedLayouts.last!.capacities["terminal"] == 4, "saving while a preview is shown saves its visible shape and draft counts")
+        precondition(pending.gridDraft != nil, "trying several presets never throws away the unsaved grid")
+        pending.presetPreview = nil
+        precondition(pending.grid.capacity(.terminal) == 4 && pending.grid.unitRect(for: .terminal) == editedRect, "Cancel returns to the exact draft")
+        pending.previewSavedLayout(savedDraft)
+        pending.presetPreview = nil
+        precondition(pending.gridDraft != nil && pending.grid.capacity(.terminal) == 4, "saved-preset previews preserve unsaved edits too")
+        precondition(pending.commitPendingGrid(), "the shared Apply/Organize path commits a draft")
+        precondition(pending.gridDraft == nil && pending.settings.capacity(.terminal) == 4 && pending.settings.unitRect(for: .terminal) == editedRect, "committing uses the edited count and frame together")
+        precondition(pending.settings.previousLayout?.capacities["terminal"] == originalCount, "the applied grid remains recoverable as Previous layout")
+        let pendingReload = WindowManager(settingsFile: fixture.appendingPathComponent("pending.json"), startPolling: false)
+        precondition(pendingReload.settings.capacity(.terminal) == 4 && pendingReload.settings.savedLayouts.last?.capacities["terminal"] == 4, "applied edits and draft presets survive restart")
+        pending.editGrid { pending.setCapacity(.terminal, 3) }
+        pending.previewPreset(PresetShape.allCases[0])
+        let previewRects = pending.presetPreview!.rects
+        precondition(pending.commitPendingGrid())
+        precondition(pending.presetPreview == nil && pending.gridDraft == nil && pending.settings.customRects == previewRects, "Organize/Apply consumes the preview and its underlying draft")
+        precondition(pending.settings.capacity(.terminal) == 3 && pending.settings.previousLayout?.capacities["terminal"] == 3, "applying a shape keeps counts and preserves the edited layout for Back")
+        pending.editGrid { precondition(pending.addCategory(name: "Draft research")) }
+        let draftCategory = pending.selectedLane
+        precondition(pending.saveGridLayout(name: "Draft category"))
+        precondition(pending.settings.savedLayouts.last!.categories.contains(where: { $0.lane == draftCategory }) && pending.settings.savedLayouts.last!.lanes.contains(draftCategory.rawValue), "saved draft presets include new categories, not only their rectangles")
+        pending.previewPreset(PresetShape.allCases[0])
+        precondition(pending.presetPreview!.lanes.contains(draftCategory), "shape previews include categories added in the draft")
+        pending.applyPresetPreview()
+        precondition(pending.enabledLanes.contains(draftCategory) && pending.gridDraft == nil, "applying a preview commits newly added categories")
+        let paneDraft = WindowManager(settingsFile: fixture.appendingPathComponent("pane-draft.json"), startPolling: false)
+        paneDraft.trusted = false
+        paneDraft.windows = terminalWindows
+        paneDraft.visibleSlotIDs[.terminal] = Array(terminalWindows.prefix(2).map(\.id))
+        paneDraft.activeSlot[.terminal] = 1
+        paneDraft.editGrid { paneDraft.setCapacity(.terminal, 1) }
+        precondition(paneDraft.visibleItems(.terminal).count == 2, "draft counts leave the live panes alone")
+        paneDraft.applyGridDraft()
+        precondition(paneDraft.visibleItems(.terminal).map(\.id) == [terminalWindows[1].id], "applying a one-pane draft retains the selected bottom window")
+
+        // A missing/closed AX window is a safe fixture: it cannot move any
+        // actual desktop window. Its last discovered frame is still recoverable.
+        let recovery = WindowManager(settingsFile: fixture.appendingPathComponent("recovery.json"), startPolling: false)
+        let missingElement = AXUIElementCreateApplication(0)
+        var outside = ManagedWindow(id: "outside-test", element: missingElement, pid: 0, bundleID: "org.example.outside", appName: "Outside", title: "Outside", icon: nil, frame: CGRect(x: 50, y: 70, width: 400, height: 300), minimized: true, lane: .desktop)
+        let originalFrame = outside.frame
+        precondition(!recovery.movePreservingOriginal(outside, to: CGRect(x: 200, y: 200, width: 400, height: 300)))
+        precondition(recovery.canUndo && recovery.snapshot[outside.id]?.frame == originalFrame && recovery.snapshot[outside.id]?.minimized == true, "moving an uncategorized window records its frame and minimized state even if AX fails")
+        outside.frame.origin = CGPoint(x: 250, y: 250)
+        outside.minimized = false
+        _ = recovery.movePreservingOriginal(outside, to: CGRect(x: 300, y: 300, width: 400, height: 300))
+        precondition(recovery.snapshot.count == 1 && recovery.snapshot[outside.id]?.frame == originalFrame && recovery.snapshot[outside.id]?.minimized == true, "repeated moves never replace the first Restore snapshot")
+        print("PASS: draft saving, preset preview/cancel, shared Apply/Organize commits, added categories, restart persistence, and uncategorized-window recovery")
         print("PASS: running-app discovery, named categories, shelf drag removal/restore, preserved assignments, drop placement, last-category protection, and hover state")
         print("Live discovery: \(manager.runningApps.count) running apps; window control granted: \(trusted)")
     }
