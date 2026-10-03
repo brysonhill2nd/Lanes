@@ -103,7 +103,7 @@ struct WindowStripMetrics {
     // Detailed strips: widest window chip, and the room taken by the handle,
     // name, pane chooser and counter (unscaled points).
     static let chipWidth = 200.0
-    static func chipRoom(slots: Int) -> Double { 175 + (slots == 2 ? 110 : slots > 2 ? 32 : 0) }
+    static func chipRoom(slots: Int) -> Double { 175 + (slots == 2 ? 128 : slots > 2 ? 32 : 0) }
     static func measure(style: WindowStripStyle, count: Int, scale: Double, availableWidth: Double, slots: Int = 1) -> WindowStripMetrics {
         let scale = min(1.5, max(0.8, scale.isFinite ? scale : 1))
         let dotsWidth = 24.0 + 18 + Double(max(0, min(16, count) - 1)) * 11
@@ -111,7 +111,7 @@ struct WindowStripMetrics {
         let small = style != .detailed
         // Detailed is as wide as its chips need, up to a full bar.
         let chips = min(760, chipRoom(slots: 1) + Double(max(2, min(16, count))) * chipWidth)
-        let width = (small ? max(190, dotsWidth + 110) : chips) + (slots > 1 ? (slots == 2 ? 110 : 32) : 0)
+        let width = (small ? max(190, dotsWidth + 110) : chips) + (slots > 1 ? (slots == 2 ? 128 : 32) : 0)
         // Both styles are one rounded row; Detailed is only wider.
         let height = 32.0
         return WindowStripMetrics(width: max(1, min(availableWidth, width * scale)), height: height * scale)
@@ -812,6 +812,10 @@ struct WindowSlots {
     static func replacing(_ slots: [String], with id: String, at index: Int) -> [String] {
         guard !slots.isEmpty, !slots.contains(id) else { return slots }
         var result = slots; result[max(0, min(slots.count - 1, index))] = id; return result
+    }
+    static func swapped(_ slots: [String], _ a: Int, _ b: Int) -> [String] {
+        guard slots.indices.contains(a), slots.indices.contains(b), a != b else { return slots }
+        var result = slots; result.swapAt(a, b); return result
     }
     static func nextID(ids: [String], slots: [String], slot: Int, delta: Int) -> String? {
         guard !slots.isEmpty else { return ids.first }

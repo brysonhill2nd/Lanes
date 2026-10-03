@@ -1132,11 +1132,45 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         guard slots.indices.contains(index), activeSlot[lane] != index else { return }
         activeSlot[lane] = index
     }
+    // In a two-pane category, clicking the other pane's label sends the window
+    // you are working in there; the window it replaces takes its old place.
     func selectSlot(_ lane: Lane, index: Int) {
         let slots = slotIDs(lane)
         guard slots.indices.contains(index) else { return }
+        if slots.count == 2, let working = focusedWindow(), working.lane == lane, let from = slots.firstIndex(of: working.id), from != index {
+            swapPanes(lane, keeping: working); return
+        }
         activeSlot[lane] = index
         if let window = items(lane).first(where: { $0.id == slots[index] }) { focus(window, hideBoard: false) }
+    }
+    // Swaps the windows of a two-pane category. Both move at once, and the window
+    // you were working in stays on top with the keyboard.
+    func swapPanes(_ lane: Lane, keeping working: ManagedWindow? = nil) {
+        guard !editingDraft else { return }
+        let slots = slotIDs(lane)
+        guard slots.count == 2, !slots[0].isEmpty, !slots[1].isEmpty else { return }
+        // Decide which window keeps the keyboard before the panes change.
+        let focused = working ?? focusedWindow().flatMap { slots.contains($0.id) ? $0 : nil }
+        let keep = focused ?? activeWindow(lane)
+        let swapped = WindowSlots.swapped(slots, 0, 1)
+        visibleSlotIDs[lane] = swapped
+        _ = apply(lane, presentationOnly: true, onlyIDs: Set(slots))
+        for id in swapped where id != keep?.id {
+            if let other = items(lane).first(where: { $0.id == id }) { _ = AXUIElementPerformAction(other.element, kAXRaiseAction as CFString) }
+        }
+        if let keep, let slot = swapped.firstIndex(of: keep.id) {
+            activeIDs[lane] = keep.id; activeSlot[lane] = slot
+            if trusted { focus(keep, hideBoard: false) }
+        }
+        status = "Swapped the \(name(lane)) panes."
+        onLaneControls?()
+    }
+    // "Show in Left/Right": a window already showing in the other pane swaps over.
+    func show(_ window: ManagedWindow, inPane index: Int) {
+        let slots = slotIDs(window.lane)
+        guard slots.indices.contains(index) else { return }
+        if slots.count == 2, let from = slots.firstIndex(of: window.id), from != index { swapPanes(window.lane, keeping: window); return }
+        activeSlot[window.lane] = index; reveal(window)
     }
     func nextWindowLabel(_ lane: Lane) -> String {
         guard let id = WindowSlots.nextID(ids: items(lane).map(\.id), slots: slotIDs(lane), slot: activeSlot[lane] ?? 0, delta: 1), let window = items(lane).first(where: { $0.id == id }) else { return "No windows" }

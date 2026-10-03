@@ -85,6 +85,12 @@ import ApplicationServices
         precondition(tabManager.activeSlot[.terminal] == 1 && tabManager.activeWindow(.terminal)?.id == "terminal-test-1", "hover targets the bottom pane without changing either window")
         precondition(tabManager.visibleItems(.terminal).map(\.id) == ["terminal-test-0", "terminal-test-1"])
         tabManager.trusted = false // Fixture AX elements must never manipulate actual windows.
+        tabManager.swapPanes(.terminal)
+        precondition(tabManager.visibleItems(.terminal).map(\.id) == ["terminal-test-1", "terminal-test-0"], "the swap button exchanges the two panes")
+        precondition(tabManager.activeWindow(.terminal)?.id == "terminal-test-1" && tabManager.activeSlot[.terminal] == 0, "the window you were using moves with the swap and stays selected")
+        tabManager.show(terminalWindows[1], inPane: 1)
+        precondition(tabManager.visibleItems(.terminal).map(\.id) == ["terminal-test-0", "terminal-test-1"], "Show in Right on the left window swaps it over instead of doing nothing")
+        precondition(tabManager.activeSlot[.terminal] == 1, "the moved window stays selected in its new pane")
         precondition(tabManager.saveGridLayout(name: "My work"))
         let savedWork = tabManager.settings.savedLayouts.last!
         let workRects = tabManager.layoutRects()

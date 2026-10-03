@@ -121,18 +121,15 @@ struct LanePickerContent: View {
         let slots = manager.slotIDs(lane)
         if slots.count == 2 {
             HStack(spacing: 3 * scale) {
-                ForEach(Array(slots.indices), id: \.self) { index in
-                    Button { manager.selectSlot(lane, index: index) } label: {
-                        Text(manager.slotLabel(lane, index: index))
-                            .font(.system(size: 9 * scale, weight: .semibold)).lineLimit(1)
-                            .padding(.horizontal, 5 * scale).padding(.vertical, 4 * scale)
-                            .foregroundStyle((manager.activeSlot[lane] ?? 0) == index ? lane.color : ink.opacity(0.6))
-                            .background((manager.activeSlot[lane] ?? 0) == index ? lane.color.opacity(0.16) : Color.clear)
-                            .clipShape(Capsule())
-                    }.buttonStyle(.plain).fixedSize()
-                        .onHover { hovering in if hovering { manager.targetSlot(lane, index: index) } }
-                        .help("\(manager.slotLabel(lane, index: index)): \(manager.items(lane).first(where: { $0.id == slots[index] }).map(manager.windowLabel) ?? "Empty")\nHover to target this pane, then scroll or use Left/Right / 1–9 / 0. The other pane stays fixed.")
-                }
+                paneButton(0, slots: slots)
+                Button { manager.swapPanes(lane) } label: {
+                    Image(systemName: manager.slotLabel(lane, index: 0) == "Left" ? "arrow.left.arrow.right" : "arrow.up.arrow.down")
+                        .font(.system(size: 8 * scale, weight: .semibold)).foregroundStyle(ink.opacity(0.6))
+                        .frame(width: 14 * scale, height: 20 * scale).contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                    .help("Swap the two panes. The window you are working in keeps the keyboard.")
+                    .accessibilityLabel("Swap \(manager.slotLabel(lane, index: 0)) and \(manager.slotLabel(lane, index: 1))")
+                paneButton(1, slots: slots)
             }
         } else if slots.count > 2 {
             Menu {
@@ -146,12 +143,24 @@ struct LanePickerContent: View {
                 .help("Target \(manager.slotLabel(lane, index: manager.activeSlot[lane] ?? 0)). Switching this slot keeps the other windows fixed.")
         }
     }
+    func paneButton(_ index: Int, slots: [String]) -> some View {
+        Button { manager.selectSlot(lane, index: index) } label: {
+            Text(manager.slotLabel(lane, index: index))
+                .font(.system(size: 9 * scale, weight: .semibold)).lineLimit(1)
+                .padding(.horizontal, 5 * scale).padding(.vertical, 4 * scale)
+                .foregroundStyle((manager.activeSlot[lane] ?? 0) == index ? lane.color : ink.opacity(0.6))
+                .background((manager.activeSlot[lane] ?? 0) == index ? lane.color.opacity(0.16) : Color.clear)
+                .clipShape(Capsule())
+        }.buttonStyle(.plain).fixedSize()
+            .onHover { hovering in if hovering { manager.targetSlot(lane, index: index) } }
+            .help("\(manager.slotLabel(lane, index: index)): \(manager.items(lane).first(where: { $0.id == slots[index] }).map(manager.windowLabel) ?? "Empty")\nClick to move the window you are working in here; the two windows swap. Hover to target this pane, then scroll or use Left/Right / 1–9 / 0.")
+    }
     @ViewBuilder func tabMenu(_ window: ManagedWindow) -> some View {
         Button("Rename tab…") { manager.beginRenamingWindow(window) }
         Button("Show window") { manager.reveal(window) }
         if manager.settings.capacity(lane) > 1 {
             ForEach(Array(manager.slotIDs(lane).indices), id: \.self) { index in
-                Button("Show in \(manager.slotLabel(lane, index: index))") { manager.selectSlot(lane, index: index); manager.reveal(window) }
+                Button("Show in \(manager.slotLabel(lane, index: index))") { manager.show(window, inPane: index) }
             }
         }
         Divider()

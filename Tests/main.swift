@@ -385,6 +385,8 @@ expect(topChanged == ["other-project", "bottom-build"], "switching the top termi
 let bottomChanged = WindowSlots.replacing(topChanged, with: "logs", at: 1)
 expect(bottomChanged == ["other-project", "logs"], "switching the bottom must leave the top terminal unchanged")
 expect(WindowSlots.replacing(originalSlots, with: "bottom-build", at: 0) == originalSlots, "clicking an already visible window focuses it instead of replacing or duplicating its peer")
+expect(WindowSlots.swapped(originalSlots, 0, 1) == ["bottom-build", "top-server"], "swapping panes exchanges exactly the two visible windows")
+expect(WindowSlots.swapped(originalSlots, 1, 1) == originalSlots && WindowSlots.swapped(originalSlots, 0, 5) == originalSlots, "a swap with itself or a missing pane changes nothing")
 expect(WindowSlots.nextID(ids: terminalQueue, slots: originalSlots, slot: 0, delta: 1) == "other-project", "sifting top skips the window pinned in the bottom slot")
 expect(WindowSlots.nextID(ids: terminalQueue, slots: originalSlots, slot: 1, delta: -1) == "logs", "reverse cycling bottom skips the pinned top window")
 let independentPlan = Layout.stack(ids: terminalQueue, foreground: topChanged, in: CGRect(x: 0, y: 36, width: 900, height: 1200), gap: 12, lane: .terminal, presentationOnly: true, onlyIDs: ["other-project"])
