@@ -5,6 +5,8 @@ import AppKit
 // transparent strip remains a stable hover target and emits no idle pixels.
 final class StripVisibility: ObservableObject {
     @Published private(set) var opacity = 1.0
+    // Lowest idle opacity. Strips drawn over windows stay faintly visible.
+    @Published var floor = 0.0
     var visible: Bool { opacity > 0 }
     private var fadeTimer: Timer?
     private var pending: DispatchWorkItem?
@@ -40,11 +42,21 @@ final class StripVisibility: ObservableObject {
     }
     deinit { pending?.cancel(); fadeTimer?.invalidate() }
 }
+// macOS can miss the exit event when a strip grows, shrinks or moves under the
+// pointer. While hovered, a strip checks where the pointer really is, so a
+// missed exit never leaves it shown or its bare number and arrow keys captured.
+enum StripHoverCheck {
+    static let interval: TimeInterval = 0.15
+    static func contains(_ frame: CGRect?, _ pointer: CGPoint) -> Bool {
+        guard let frame else { return false }
+        return frame.insetBy(dx: -4, dy: -4).contains(pointer)
+    }
+}
 struct FadingStripContent: View {
     @ObservedObject var visibility: StripVisibility
     let content: AnyView
     var body: some View {
-        content.opacity(visibility.opacity)
+        content.opacity(max(visibility.floor, visibility.opacity))
     }
 }
 
@@ -57,6 +69,8 @@ final class LaneScrollHostingView: NSHostingView<AnyView> {
         visibility.start()
     }
     override var isOpaque: Bool { false }
+    var pointerLocation: () -> CGPoint = { NSEvent.mouseLocation }
+    private var hoverCheck: Timer?
     private var hoverTracking: NSTrackingArea?
     private var accumulator = LaneScrollAccumulator()
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -66,10 +80,24 @@ final class LaneScrollHostingView: NSHostingView<AnyView> {
         let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
         addTrackingArea(tracking); hoverTracking = tracking
     }
-    override func mouseEntered(with event: NSEvent) { visibility.setHovered(true); onHover?(true) }
-    override func mouseExited(with event: NSEvent) { visibility.setHovered(false); onHover?(false) }
+    override func mouseEntered(with event: NSEvent) { visibility.setHovered(true); onHover?(true); watchPointer() }
+    override func mouseExited(with event: NSEvent) { endHover() }
+    private func endHover() {
+        hoverCheck?.invalidate(); hoverCheck = nil
+        visibility.setHovered(false); onHover?(false)
+    }
+    private func watchPointer() {
+        hoverCheck?.invalidate()
+        hoverCheck = Timer.scheduledTimer(withTimeInterval: StripHoverCheck.interval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                // A held button is a strip drag in progress; the panel follows the pointer.
+                guard let self, NSEvent.pressedMouseButtons == 0 else { return }
+                if !StripHoverCheck.contains(self.window?.frame, self.pointerLocation()) { self.endHover() }
+            }
+        }
+    }
     override func viewWillMove(toWindow newWindow: NSWindow?) {
-        if window != nil && newWindow == nil { visibility.cancel(); onHover?(false) }
+        if window != nil && newWindow == nil { hoverCheck?.invalidate(); hoverCheck = nil; visibility.cancel(); onHover?(false) }
         super.viewWillMove(toWindow: newWindow)
     }
     override func scrollWheel(with event: NSEvent) {

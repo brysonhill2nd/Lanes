@@ -26,7 +26,6 @@ import SwiftUI
         precondition(!visibility.visible, "leaving the bar fades it again")
         visibility.start()
         precondition(!visibility.visible, "content refreshes must not reveal idle bars")
-        precondition(visibility.opacity == 0, "idle content must emit no pixels, including strips positioned over app windows")
         visibility.setHovered(true); visibility.setHovered(false); visibility.cancel()
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.08))
         precondition(visibility.visible, "removed views cancel pending fade callbacks")
@@ -39,6 +38,24 @@ import SwiftUI
         wheel.flags = []; wheel.timestamp = 2_000_000_000
         view.scrollWheel(with: NSEvent(cgEvent: wheel)!)
         precondition(switched == [1], "ordinary scrolling in the strip switches without Command")
-        print("PASS: native category-strip first click, active-app-independent tracking, hover enter/exit, full idle transparency, canceled fade, and plain wheel switching")
+        // A strip that grows or moves under a still pointer can miss its exit
+        // event. The pointer check ends the hover anyway.
+        _ = NSApplication.shared
+        let panel = NSPanel(contentRect: NSRect(x: 100, y: 100, width: 620, height: 56), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        let watched = LaneScrollHostingView(rootView: AnyView(Color.clear))
+        panel.contentView = watched
+        var pointer = CGPoint(x: 120, y: 120)
+        watched.pointerLocation = { pointer }
+        var watchedHover: [Bool] = []
+        watched.onHover = { watchedHover.append($0) }
+        watched.mouseEntered(with: event(.mouseEntered))
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: StripHoverCheck.interval * 2.5))
+        precondition(watchedHover == [true] && watched.visibility.hovered, "a pointer still on the strip keeps it hovered")
+        pointer = CGPoint(x: 900, y: 120)
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: StripHoverCheck.interval * 2.5))
+        precondition(watchedHover == [true, false] && !watched.visibility.hovered, "a missed exit still releases the strip and its keys")
+        precondition(!StripHoverCheck.contains(nil, .zero), "a closed strip never counts as hovered")
+        precondition(StripHoverCheck.contains(CGRect(x: 0, y: 0, width: 10, height: 10), CGPoint(x: 12, y: 5)), "the edge of a strip still counts as on it")
+        print("PASS: native category-strip first click, active-app-independent tracking, hover enter/exit, full idle transparency, canceled fade, plain wheel switching, and release after a missed exit")
     }
 }

@@ -148,7 +148,7 @@ import QuartzCore
         showBoard()
         let alert = NSAlert()
         alert.messageText = "Your windows, from the keyboard"
-        alert.informativeText = "Double-tap Right Command to organize your desktop. You can turn this off in Preferences.\n\nHover a category strip and scroll, press Left/Right, or use 1–9 (0 selects window 10) to sift. Two-window categories have direct Top/Bottom or Left/Right targets. Strips fade fully transparent when idle.\nBackspace deletes a selected grid category (outside text fields).\n\nOther commands start with Control–Option–Command.\n\n1–7: cycle individual windows in each category\nTab: cycle the focused window’s category\nShift–Tab: cycle backward\nShift–1…7: send the focused window to a category and resize it\nArrow keys: nudge by 24 pt inside its lane\nShift–arrow keys: resize by 24 pt\nReturn: auto-sort the desktop\nZ: restore original windows\n\n1 Terminal · 2 Simulators · 3 Previews · 4 Desktop · 5 Messaging · 6 Mini players · 7 Browser\n\nSet Windows shown at once to 1 to create one-window clusters for Messaging or your Arc windows. Arc windows are tracked separately."
+        alert.informativeText = "Double-tap Right Command to organize your desktop. You can turn this off in Preferences.\n\nHover a category strip and scroll, press Left/Right, or use 1–9 (0 selects window 10) to sift. Two-window categories have direct Top/Bottom or Left/Right targets. Strips on the windows fade to a faint outline when idle.\nBackspace deletes a selected grid category (outside text fields).\n\nOther commands start with Control–Option–Command.\n\n1–7: cycle individual windows in each category\nTab: cycle the focused window’s category\nShift–Tab: cycle backward\nShift–1…7: send the focused window to a category and resize it\nArrow keys: nudge by 24 pt inside its lane\nShift–arrow keys: resize by 24 pt\nReturn: auto-sort the desktop\nZ: restore original windows\n\n1 Terminal · 2 Simulators · 3 Previews · 4 Desktop · 5 Messaging · 6 Mini players · 7 Browser\n\nSet Windows shown at once to 1 to create one-window clusters for Messaging or your Arc windows. Arc windows are tracked separately."
         alert.addButton(withTitle: "Got it")
         alert.beginSheetModal(for: window)
     }
@@ -202,7 +202,7 @@ import QuartzCore
                     boardIsKey: NSApp.keyWindow === self.window) {
                     self.manager.editGrid { self.manager.deleteSelectedCategory() }; return true
                 }
-                if let action = StripKeyAction.action(keyCode: event.keyCode, hasModifiers: !flags.isEmpty, hovering: self.manager.hoveredLane != nil) {
+                if let action = StripKeyAction.action(keyCode: event.keyCode, hasModifiers: !flags.isEmpty, hovering: self.pointerOnHoveredStrip()) {
                     self.manager.handleStripKey(action); return true
                 }
                 let required: NSEvent.ModifierFlags = [.command, .option, .control]
@@ -224,6 +224,17 @@ import QuartzCore
             var reference: EventHotKeyRef?
             if RegisterEventHotKey(key, 0, EventHotKeyID(signature: 0x4C414E45, id: id), GetApplicationEventTarget(), 0, &reference) == noErr, let reference { hoverHotkeys.append(reference) }
         }
+    }
+    func pointerOnHoveredStrip() -> Bool {
+        guard let lane = manager.hoveredLane else { return false }
+        return StripHoverCheck.contains(laneControlByID[lane]?.frame, NSEvent.mouseLocation)
+    }
+    // A hover that outlived the pointer must not swallow typing: release the
+    // strip keys, then hand the key press to the app you are typing in.
+    func passThrough(_ key: UInt16) {
+        manager.hoveredLane = nil
+        let source = CGEventSource(stateID: .hidSystemState)
+        for down in [true, false] { CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down)?.post(tap: .cghidEventTap) }
     }
     func updateTapMonitor() {
         if let globalTapMonitor { NSEvent.removeMonitor(globalTapMonitor); self.globalTapMonitor = nil }
@@ -251,7 +262,9 @@ import QuartzCore
         case 3: manager.undo()
         case 4: manager.cycleFocused()
         case 5: manager.cycleFocused(delta: -1)
-        case 50...61: manager.handleStripKey(StripKeyAction.bindings[Int(id - 50)].1)
+        case 50...61:
+            let binding = StripKeyAction.bindings[Int(id - 50)]
+            if pointerOnHoveredStrip() { manager.handleStripKey(binding.1) } else { passThrough(binding.0) }
         case 10...16: manager.cycleWindow(Lane.allCases[Int(id - 10)])
         case 20...26: manager.sendFocused(to: Lane.allCases[Int(id - 20)])
         case 30...33, 40...43:
