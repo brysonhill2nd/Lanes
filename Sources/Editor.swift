@@ -34,6 +34,7 @@ struct GridEditor: View {
                         Button(manager.name(lane)) { manager.editGrid { manager.restoreCategory(lane) } }
                     }
                 }.font(.system(size: 11))
+                FloatButton(manager: manager, lane: manager.selectedLane)
                 Menu {
                     Button("Split left / right") { manager.editGrid { manager.splitCategory(manager.selectedLane, sideBySide: true) } }
                     Button("Split top / bottom") { manager.editGrid { manager.splitCategory(manager.selectedLane, sideBySide: false) } }
@@ -41,7 +42,8 @@ struct GridEditor: View {
                     .help("Cut this category into two independent places, then move or resize each")
                 MoveWindowMenu(manager: manager, lane: manager.selectedLane)
                 Spacer(minLength: 0)
-            }
+            }.background(GeometryReader { geometry in Color.clear.preference(key: EditorFrameKey.self, value: ["row": geometry.frame(in: .named("categoryWorkspace"))]) })
+            let gridSize = GridPreviewSize.fit(width: Double(frames["row"]?.width ?? 0), display: manager.screenFrame.size)
             GeometryReader { proxy in
                 ZStack(alignment: .topLeading) {
                     Canvas { context, size in
@@ -52,7 +54,7 @@ struct GridEditor: View {
                             }
                         }
                     }.allowsHitTesting(false)
-                    ForEach(manager.gridLanes) { lane in
+                    ForEach(manager.stackedGridLanes) { lane in
                         EditableCategory(manager: manager, lane: lane, area: proxy.size, swapMode: swapMode, onDrag: { point in
                             draggingLane = lane
                             let origin = frames["grid"]?.origin ?? .zero
@@ -74,7 +76,7 @@ struct GridEditor: View {
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.white.opacity(0.07)).allowsHitTesting(false))
                     .dropDestination(for: String.self) { values, point in var placed = false; manager.editGrid { placed = manager.receiveWorkspaceDrop(values, at: point, in: proxy.size) }; return placed }
                     .background(GeometryReader { geometry in Color.clear.preference(key: EditorFrameKey.self, value: ["grid": geometry.frame(in: .named("categoryWorkspace"))]) })
-            }.frame(height: 330)
+            }.frame(width: gridSize.width, height: gridSize.height).frame(maxWidth: .infinity)
             categoryShelf
             CategoryInspector(manager: manager)
             Text(swapMode ? "Drag categories to swap regions, or into the shelf to remove them. Drag a shelf category back into the workspace to restore it." : "Drag edges to resize, the center to move, or drag a category into the shelf to remove it. Drag it back to restore it. Backspace also removes the selected section.")
@@ -128,6 +130,7 @@ struct CategoryBoard: View {
     @ObservedObject var manager: WindowManager
     @State private var target: Lane?
     @State private var outsideTargeted = false
+    @State private var leaveTargeted = false
     @State private var byWindow: Bool
     init(manager: WindowManager, byWindow: Bool = true) { self.manager = manager; _byWindow = State(initialValue: byWindow) }
     var gridLanes: [Lane] { manager.enabledLanes }
@@ -136,9 +139,9 @@ struct CategoryBoard: View {
         var seen: Set<String> = []
         return manager.runningApps.filter { seen.insert($0.bundleID).inserted }
     }
-    var outsideApps: [RunningAppSummary] { apps.filter { !gridLanes.contains($0.lane) } }
+    var outsideApps: [RunningAppSummary] { apps.filter { !gridLanes.contains($0.lane) && !manager.isIgnored($0.bundleID) } }
     var outsideWindows: [ManagedWindow] { manager.outsideGrid.filter { !$0.minimized } }
-    func apps(in lane: Lane) -> [RunningAppSummary] { apps.filter { $0.lane == lane } }
+    func apps(in lane: Lane) -> [RunningAppSummary] { apps.filter { $0.lane == lane && !manager.isIgnored($0.bundleID) } }
     func automatic(_ app: RunningAppSummary) -> Lane { Classifier.lane(bundleID: app.bundleID, appName: app.name, title: "", rules: [:]) }
     // Laid out like your grid on the screen.
     var stacks: [[Lane]] {
@@ -156,6 +159,7 @@ struct CategoryBoard: View {
                  : "Drag an app onto a category and every window of that app moves there; drag it back to the left to undo.")
                 .font(.system(size: 11)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
             HStack(alignment: .top, spacing: 14) {
+                VStack(alignment: .leading, spacing: 12) {
                 VStack(alignment: .leading, spacing: 6) {
                     heading("NOT IN YOUR GRID", count: byWindow ? outsideWindows.count : outsideApps.count)
                     if byWindow {
@@ -172,6 +176,8 @@ struct CategoryBoard: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(outsideTargeted ? 0.3 : 0), style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
                 // Dropping here undoes a choice: the window or app goes back to its usual category.
                 .dropDestination(for: String.self) { values, _ in unassign(values) } isTargeted: { outsideTargeted = $0 }
+                leaveAlone
+                }
                 Rectangle().fill(Color.white.opacity(0.07)).frame(width: 1)
                 HStack(alignment: .top, spacing: 10) {
                     ForEach(Array(stacks.enumerated()), id: \.offset) { _, stack in
@@ -181,6 +187,31 @@ struct CategoryBoard: View {
             }
         }
         .foregroundStyle(ink)
+    }
+    // Apps Lanes never touches. Drag one onto a category to manage it again.
+    var leaveAlone: some View {
+        let ignored = manager.ignoredAppList
+        return VStack(alignment: .leading, spacing: 6) {
+            heading("LEAVE ALONE", count: ignored.count)
+            if ignored.isEmpty { empty("Drag an app or window here and Lanes never moves it or gives it a tab.") }
+            ForEach(ignored) { app in
+                HStack(spacing: 8) {
+                    grip
+                    if let icon = app.icon { Image(nsImage: icon).resizable().frame(width: 20, height: 20) }
+                    Text(app.name).font(.system(size: 12)).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Button { manager.manageApp(app.id) } label: { Image(systemName: "arrow.uturn.backward").font(.system(size: 9, weight: .semibold)).foregroundStyle(muted) }
+                        .buttonStyle(.plain).help("Let Lanes manage \(app.name) again")
+                }
+                .modifier(DragRow())
+                .draggable("app:" + app.id) { dragPreview(app.name, icon: app.icon) }
+            }
+        }
+        .padding(8)
+        .frame(width: 266, alignment: .topLeading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(leaveTargeted ? 0.07 : 0.025)))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(leaveTargeted ? 0.3 : 0.08), style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
+        .dropDestination(for: String.self) { values, _ in ignore(values) } isTargeted: { leaveTargeted = $0 }
     }
     func heading(_ title: String, count: Int) -> some View {
         HStack(spacing: 6) {
@@ -228,6 +259,8 @@ struct CategoryBoard: View {
                     }
                 }
                 if manager.settings.appRules[app.bundleID] != nil { Divider(); Button("Use automatic category") { manager.resetAppRule(app) } }
+                Divider()
+                Button("Leave \(app.name) alone") { manager.ignoreApp(app.bundleID, name: app.name) }
             } label: { Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(muted) }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Choose a category")
         }
@@ -255,6 +288,7 @@ struct CategoryBoard: View {
                 Divider()
                 Button("Show window") { manager.reveal(window) }
                 Button("Rename tab…") { manager.beginRenamingWindow(window) }
+                Button("Leave \(window.appName) alone") { manager.ignoreApp(window.bundleID, name: window.appName) }
             } label: { Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(muted) }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Choose a category, show the window, or rename its tab")
         }
@@ -273,8 +307,24 @@ struct CategoryBoard: View {
         if let value = values.first(where: { $0.hasPrefix("lanewindow:") }), let window = manager.windows.first(where: { $0.id == String(value.dropFirst(11)) }) {
             manager.clearWindowCategory(window); return true
         }
-        if let value = values.first(where: { $0.hasPrefix("app:") }), let app = manager.runningApps.first(where: { $0.bundleID == String(value.dropFirst(4)) }) {
-            manager.resetAppRule(app); return true
+        if let value = values.first(where: { $0.hasPrefix("app:") }) {
+            let bundle = String(value.dropFirst(4))
+            if manager.isIgnored(bundle) { manager.manageApp(bundle); return true }
+            if let app = manager.runningApps.first(where: { $0.bundleID == bundle }) { manager.resetAppRule(app); return true }
+        }
+        return false
+    }
+    // Dropped on Leave alone: the whole app, from a window, an app row or a strip tab.
+    func ignore(_ values: [String]) -> Bool {
+        for value in values {
+            let windowID = value.hasPrefix("lanewindow:") ? String(value.dropFirst(11)) : value.hasPrefix("tab:") ? String(value.dropFirst(4)) : nil
+            if let windowID, let window = (manager.windows + manager.outsideGrid).first(where: { $0.id == windowID }) {
+                manager.ignoreApp(window.bundleID, name: window.appName); return true
+            }
+            if value.hasPrefix("app:") {
+                let bundle = String(value.dropFirst(4))
+                manager.ignoreApp(bundle, name: manager.runningApps.first { $0.bundleID == bundle }?.name ?? "This app"); return true
+            }
         }
         return false
     }
@@ -287,6 +337,7 @@ struct CategoryBoard: View {
         }
         guard let value = values.first(where: { $0.hasPrefix("app:") }),
               let app = manager.runningApps.first(where: { $0.bundleID == String(value.dropFirst(4)) }) else { return false }
+        manager.manageApp(app.bundleID)
         manager.assignApp(app, to: lane)
         return true
     }
@@ -316,15 +367,23 @@ struct EditableCategory: View {
         let unit = rect
         let frame = Layout.frame(unit: unit, in: CGRect(origin: .zero, size: area), gap: 7)
         let selected = manager.selectedLane == lane
+        let floating = manager.isFloating(lane)
         GeometryReader { inner in
             ZStack(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: 7).fill(lane.color.opacity(selected || targeted ? 0.10 : 0.04))
+                // A floating category is opaque so the grid under it reads as covered.
+                if floating { RoundedRectangle(cornerRadius: 7).fill(surface) }
+                RoundedRectangle(cornerRadius: 7).fill(lane.color.opacity(selected || targeted ? 0.10 : floating ? 0.07 : 0.04))
                 VStack(alignment: .leading, spacing: 7) {
                     HStack(spacing: 5) {
                         HStack(spacing: 5) {
                             Image(systemName: lane.symbol).font(.system(size: 11))
                             Text(manager.name(lane)).font(.system(size: 11, weight: .semibold)).lineLimit(1)
                         }.draggable("lane:" + lane.rawValue).help("Drag to the category shelf to remove from workspace")
+                        if floating && inner.size.width > 170 {
+                            Text("FLOATS").font(.system(size: 8, weight: .bold)).tracking(1).foregroundStyle(lane.color)
+                                .padding(.horizontal, 5).padding(.vertical, 2).background(lane.color.opacity(0.14)).clipShape(Capsule())
+                                .help("Floats over the grid. Switching to one of its windows brings it on top.")
+                        }
                         Spacer(minLength: 0)
                         WindowCountMenu(manager: manager, lane: lane, compact: inner.size.width < 300, staged: true)
                     }.foregroundStyle(lane.color)
@@ -366,14 +425,18 @@ struct EditableCategory: View {
                 } isTargeted: { targeted = $0 }
                 .contextMenu {
                     WindowCountMenu(manager: manager, lane: lane, staged: true)
+                    Button(floating ? "Put back in the grid" : "Float over the grid") { manager.editGrid { manager.setFloating(lane, !floating) } }
+                        .disabled(!floating && manager.baseGridLanes.count < 2)
                     Button("Split left / right") { manager.editGrid { manager.splitCategory(lane, sideBySide: true) } }
                     Button("Split top / bottom") { manager.editGrid { manager.splitCategory(lane, sideBySide: false) } }
                     MoveWindowMenu(manager: manager, lane: lane)
                     Button("Rename category…") { manager.renameTarget = lane }
                     Button("Delete category", role: .destructive) { manager.editGrid { manager.removeCategory(lane) } }.disabled(manager.gridLanes.count <= 1)
                 }
-        }.frame(width: max(1, frame.width), height: max(1, frame.height)).offset(x: frame.minX, y: frame.minY)
-            .zIndex(start == nil ? 0 : 2)
+        }.frame(width: max(1, frame.width), height: max(1, frame.height))
+            .shadow(color: .black.opacity(floating ? 0.45 : 0), radius: 10, y: 4)
+            .offset(x: frame.minX, y: frame.minY)
+            .zIndex(start == nil ? (floating ? 1 : 0) : 2)
     }
     func grip(_ edge: ResizeEdge, size: CGSize) -> some View {
         let horizontal = edge == .top || edge == .bottom
@@ -395,12 +458,12 @@ struct EditableCategory: View {
                 case .began: resizeStart = manager.layoutRects()
                 case .changed:
                     guard let resizeStart else { return }
-                    manager.editorPreview = GridGeometry.resizing(resizeStart, lane: lane, edge: edge,
-                        dx: delta.width / area.width, dy: delta.height / area.height, snap: manager.settings.snapToGrid)
+                    manager.editorPreview = manager.resizedGrid(resizeStart, lane: lane, edge: edge,
+                        dx: delta.width / area.width, dy: delta.height / area.height)
                 case .ended:
                     guard let resizeStart else { return }
-                    let rects = GridGeometry.resizing(resizeStart, lane: lane, edge: edge,
-                        dx: delta.width / area.width, dy: delta.height / area.height, snap: manager.settings.snapToGrid)
+                    let rects = manager.resizedGrid(resizeStart, lane: lane, edge: edge,
+                        dx: delta.width / area.width, dy: delta.height / area.height)
                     manager.editGrid { manager.commitGridResize(rects, lane: lane) }; self.resizeStart = nil
                 }
             }
@@ -434,6 +497,20 @@ struct EditableCategory: View {
                 }
                 start = nil; candidate = nil
             }
+    }
+}
+
+// Float the selected category over the grid, or put it back in.
+struct FloatButton: View {
+    @ObservedObject var manager: WindowManager
+    let lane: Lane
+    var body: some View {
+        let floating = manager.isFloating(lane)
+        Button { manager.editGrid { manager.setFloating(lane, !floating) } } label: {
+            Label(floating ? "Back in grid" : "Float", systemImage: floating ? "rectangle.split.2x1" : "rectangle.on.rectangle")
+        }.font(.system(size: 11))
+            .disabled(!manager.gridLanes.contains(lane) || (!floating && manager.baseGridLanes.count < 2))
+            .help(floating ? "Put \(manager.name(lane)) back in the grid next to the others" : "Float \(manager.name(lane)) over the grid, like a Terminal over a full-screen Browser. Switching to one of its windows brings it on top.")
     }
 }
 
@@ -554,7 +631,7 @@ struct PresetPreviewLayer: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             Rectangle().fill(surface)
-            ForEach(preview.lanes) { lane in
+            ForEach(preview.lanes.filter { !preview.floating.contains($0.rawValue) } + preview.lanes.filter { preview.floating.contains($0.rawValue) }) { lane in
                 if let r = preview.rects[lane.rawValue]?.cgRect {
                     let frame = CGRect(x: r.minX * size.width + 3, y: r.minY * size.height + 3, width: max(0, r.width * size.width - 6), height: max(0, r.height * size.height - 6))
                     VStack(alignment: .leading, spacing: 5) {
@@ -567,7 +644,9 @@ struct PresetPreviewLayer: View {
                     .padding(10)
                     .frame(width: frame.width, height: frame.height, alignment: .topLeading)
                     .background(RoundedRectangle(cornerRadius: 7).fill(lane.color.opacity(0.10)))
+                    .background(RoundedRectangle(cornerRadius: 7).fill(surface).opacity(preview.floating.contains(lane.rawValue) ? 1 : 0))
                     .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(lane.color.opacity(0.45), style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
+                    .shadow(color: .black.opacity(preview.floating.contains(lane.rawValue) ? 0.45 : 0), radius: 10, y: 4)
                     .offset(x: frame.minX, y: frame.minY)
                 }
             }

@@ -193,9 +193,9 @@ struct BoardView: View {
             Text("PRESETS").font(.system(size: 9, weight: .semibold)).tracking(1.5).foregroundStyle(muted)
             ScrollView(.horizontal) {
                 HStack(spacing: 8) {
-                    ForEach(PresetShape.allCases) { shape in
+                    ForEach(manager.presetShapes) { shape in
                         presetChip(shape.title, symbol: shape.symbol, active: manager.presetPreview?.shape == shape) { manager.previewPreset(shape) }
-                            .help(shape.subtitle + ". The main category is the one selected in the sidebar.")
+                            .help(shape.subtitle + (shape == .overlay ? ". Floating categories come on top when you switch to one of their windows." : ". The main category is the one selected in the sidebar."))
                     }
                     if !manager.settings.savedLayouts.isEmpty { Rectangle().fill(Color.white.opacity(0.1)).frame(width: 1, height: 22) }
                     ForEach(manager.settings.savedLayouts) { layout in
@@ -427,7 +427,7 @@ struct SettingsView: View {
                     ForEach(NewWindowPlacement.allCases) { choice in Text(choice.title).tag(choice) }
                 }.labelsHidden().pickerStyle(.segmented).frame(width: 260)
             }
-            Text(manager.settings.newWindowPlacement == .center ? "A new window opens centered on this display at its own size. Nothing else moves. New tabs stay with their window."
+            Text(manager.settings.newWindowPlacement == .center ? "A new window from an app with a category opens in it, like WhatsApp in Messaging. Other new windows open centered at their own size. New tabs stay with their window."
                  : manager.settings.newWindowPlacement == .leave ? "New windows stay wherever their app opens them. Nothing moves until you press Organize."
                  : "After Organize, each new window goes into its category. Existing windows stay fixed. Auto layout explicitly chooses new category sizes.")
                 .font(.system(size: 10)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
@@ -453,14 +453,26 @@ struct SettingsView: View {
                 Text("Window strip style").font(.system(size: 12))
                 Picker("Window strip style", selection: Binding(get: { manager.settings.windowStripStyle }, set: { manager.settings.windowStripStyle = $0; manager.stripAppearanceChanged() })) {
                     ForEach(WindowStripStyle.allCases) { style in Text(style.title).tag(style) }
-                }.labelsHidden().pickerStyle(.segmented).frame(width: 340)
+                }.labelsHidden().pickerStyle(.segmented).frame(width: 390)
             }.disabled(!manager.settings.showLaneControls)
+            HStack {
+                Text("Window list on hover").font(.system(size: 12))
+                Picker("Window list on hover", selection: Binding(get: { manager.settings.stripList }, set: { manager.settings.stripList = $0; manager.save(); manager.onLaneControls?() })) {
+                    ForEach(StripListMode.allCases) { mode in Text(mode.title).tag(mode) }
+                }.labelsHidden().pickerStyle(.segmented).frame(width: 260)
+            }.disabled(!manager.settings.showLaneControls || !manager.settings.windowStripStyle.expandsOnHover)
+            Text(manager.settings.windowStripStyle == .line ? "Line: each strip is a thin bar in its category's color, one segment per window, the one showing brighter. Hover it to open the full strip" + (manager.settings.stripList == .never ? "." : manager.settings.stripList == .always ? " as a list of window names." : ", or a list of window names on narrow tiles.")
+                 : !manager.settings.windowStripStyle.expandsOnHover ? "Choose Expand on hover or Line above to use the window list."
+                 : manager.settings.stripList == .narrow ? "Hovering a strip opens a list of whole window names, one per line, when its tile is too narrow for readable tabs. Wide tiles keep their row of tabs."
+                 : manager.settings.stripList == .always ? "Hovering any strip opens a list of whole window names, one per line, with the number key for each."
+                 : "Hovering a strip always shows its row of tabs.")
+                .font(.system(size: 10)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Text("Strip size").font(.system(size: 12))
                 Slider(value: Binding(get: { manager.settings.windowStripScale }, set: { manager.settings.windowStripScale = $0; manager.stripAppearanceChanged(retile: false) }), in: 0.8...1.5, step: 0.1, onEditingChanged: { editing in if !editing { manager.stripAppearanceChanged() } }).frame(width: 160)
                 Text("\(Int(manager.settings.windowStripScale * 100))% ").font(.system(size: 11, design: .monospaced)).foregroundStyle(muted)
             }.disabled(!manager.settings.showLaneControls)
-            Text("Bars fade completely transparent when idle. Hover their area to reveal them; scroll or use Left/Right and 1–9 (0 = window 10). Right-click to customize.")
+            Text("Strips on the windows fade to a faint outline when idle. Hover one to reveal it; scroll or use Left/Right and 1–9 (0 = window 10). Right-click to customize.")
                 .font(.system(size: 10)).foregroundStyle(muted)
             Toggle("Reserve a shelf for mini players", isOn: Binding(get: { manager.gridLanes.contains(.media) }, set: { on in manager.editGrid { if on { manager.restoreCategory(.media) } else { manager.removeCategory(.media) } } })).font(.system(size: 12))
             Text("Use a Picture-in-Picture or compact player window, then send it to category 6. App minimum sizes still apply.").font(.system(size: 10)).foregroundStyle(muted)
@@ -482,6 +494,8 @@ struct SettingsView: View {
             Divider()
             Toggle("Double-tap Right Command to organize", isOn: Binding(get: { manager.settings.doubleRightCommand }, set: { manager.settings.doubleRightCommand = $0; manager.save() })).font(.system(size: 12))
             Text("Two quick taps, with no other keys held. Window control must be enabled for use in other apps.").font(.system(size: 10)).foregroundStyle(muted)
+            Toggle("Keep windows in their tiles", isOn: Binding(get: { manager.settings.keepLayout }, set: { manager.settings.keepLayout = $0; manager.save() })).font(.system(size: 12))
+            Text("If a computer-use agent (Codex, Claude and others) or an app moves or resizes an arranged window, Lanes puts it back. Only your own mouse and keyboard rearrange windows.").font(.system(size: 10)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
             Text("GLOBAL SHORTCUTS").font(.system(size: 9, weight: .semibold)).tracking(1).foregroundStyle(muted)
             Text("Hold Control, Option and Command (the three keys left of the Space bar), then press:").font(.system(size: 11)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
             VStack(spacing: 8) {

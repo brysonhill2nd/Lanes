@@ -63,6 +63,11 @@ for (bundle, name, title, expected) in classification {
     expect(Classifier.lane(bundleID: bundle, appName: name, title: title, rules: [:]) == expected, "classification for \(name)")
 }
 expect(Classifier.lane(bundleID: "company.thebrowser.Browser", appName: "Arc", title: "Instagram", rules: ["company.thebrowser.Browser": "desktop"]) == .desktop, "saved app rule overrides title heuristics")
+// Center mode sends a new window to its app's category, and centers it only when there is none.
+expect(Classifier.knownLane(bundleID: "net.whatsapp.WhatsApp", appName: "\u{200E}WhatsApp", title: "WhatsApp", rules: [:]) == .messaging, "a new WhatsApp window has Messaging to go to")
+expect(Classifier.knownLane(bundleID: "com.example.notes", appName: "Notes Pro", title: "Untitled", rules: [:]) == nil, "an app Lanes does not recognize has no category, so its new window opens centered")
+expect(Classifier.lane(bundleID: "com.example.notes", appName: "Notes Pro", title: "Untitled", rules: [:]) == .desktop, "Organize still files an unrecognized app in Desktop")
+expect(Classifier.knownLane(bundleID: "com.example.notes", appName: "Notes Pro", title: "", rules: ["com.example.notes": "desktop"]) == .desktop, "an app you assigned to Desktop goes there")
 let encoded = try JSONEncoder().encode(settings)
 let decoded = try JSONDecoder().decode(Settings.self, from: encoded)
 expect(decoded.splits == settings.splits && decoded.capacity(.terminal) == 2 && !decoded.autoArrange, "settings roundtrip and safe defaults")
@@ -101,6 +106,20 @@ for template in Template.allCases {
 }
 expect(Classifier.lane(bundleID: "com.google.Chrome", appName: "Chrome", title: "Picture in Picture", rules: [:]) == .media, "Picture-in-Picture gets dedicated media shelf")
 expect(Classifier.lane(bundleID: "com.spotify.client", appName: "Spotify", title: "Mini player", rules: [:]) == .media, "mini Spotify belongs to media shelf")
+expect(FocusConfirm.shouldRaise(appInFront: true, topWindow: 7, wanted: 9, pressedSince: false), "the app put another of its windows on top: the chosen one is raised again")
+expect(!FocusConfirm.shouldRaise(appInFront: true, topWindow: 9, wanted: 9, pressedSince: false), "the chosen window is already on top")
+expect(!FocusConfirm.shouldRaise(appInFront: false, topWindow: 7, wanted: 9, pressedSince: false) && !FocusConfirm.shouldRaise(appInFront: true, topWindow: 7, wanted: 9, pressedSince: true) && !FocusConfirm.shouldRaise(appInFront: true, topWindow: nil, wanted: 9, pressedSince: false), "never raise over another app, after a new click, or without knowing what is on top")
+expect(FocusConfirm.covered(before: ["desktop#0": 5, "browser#0": 7, "messaging#0": 3], after: ["desktop#0": 8, "browser#0": 9, "messaging#0": 3], wanted: 9, sameApp: [7, 8, 9]) == [5], "the app also raised its own window over Desktop: Desktop gets its window back, the chosen pane keeps the chosen window")
+expect(FocusConfirm.covered(before: ["desktop#0": 5], after: ["desktop#0": 6], wanted: 9, sameApp: [8, 9]).isEmpty, "another app's window appearing in a pane is left alone")
+expect(FocusConfirm.covered(before: ["desktop#0": 9, "terminal#1": 4], after: ["desktop#0": 8], wanted: 9, sameApp: [8, 9]).isEmpty, "a pane the chosen window left, or one showing nothing known now, is not restored")
+var pressClock = UserInputClock()
+pressClock.pointer(held: true, sourcePID: 0, at: 10); pressClock.pointer(held: false, sourcePID: 0, at: 10.1); pressClock.pointer(held: true, sourcePID: 77, at: 12)
+expect(pressClock.pressed(since: 9) && !pressClock.pressed(since: 10.05), "only a new press of your own mouse counts as choosing something else")
+expect(Classifier.isWindow(subrole: "AXStandardWindow", modal: false, minimizable: false, zoomable: false, resizable: false), "a standard window always counts")
+expect(Classifier.isWindow(subrole: "AXSystemDialog", modal: false, minimizable: true, zoomable: true, resizable: true), "Little Arc calls itself a dialog but behaves like a window, so it gets a tab")
+expect(!Classifier.isWindow(subrole: "AXDialog", modal: false, minimizable: false, zoomable: false, resizable: true), "an alert or open panel is not a window")
+expect(!Classifier.isWindow(subrole: "AXSystemDialog", modal: true, minimizable: true, zoomable: true, resizable: true), "a modal dialog is not a window")
+expect(!Classifier.isWindow(subrole: "AXFloatingWindow", modal: false, minimizable: true, zoomable: true, resizable: true) && !Classifier.isWindow(subrole: nil, modal: false, minimizable: true, zoomable: true, resizable: true), "palettes and unlabelled windows stay out")
 var arrangement: [String: String] = [:]
 for source in Lane.legacyCases {
     for target in Lane.legacyCases {
@@ -362,7 +381,7 @@ for style in WindowStripStyle.allCases {
     for count in [0, 1, 6, 16, 40] {
         for scale in [0.8, 1.0, 1.5] {
             let metrics = WindowStripMetrics.measure(style: style, count: count, scale: scale, availableWidth: 200)
-            expect(metrics.width > 0 && metrics.width <= 200 && metrics.height >= 20 && metrics.reservedHeight == metrics.height + 8, "strip geometry fits the category and reserves only its own height")
+            expect(metrics.width > 0 && metrics.width <= 200 && metrics.height >= (style == .line ? 11 : 20) && metrics.reservedHeight == metrics.height + 8, "strip geometry fits the category and reserves only its own height")
         }
     }
 }
@@ -417,7 +436,7 @@ print("PASS: before/after tab drops; \(checks) total model checks")
 
 let migratedDots = try JSONDecoder().decode(Settings.self, from: Data(#"{"windowStripStyle":"dots","categoryStripStyles":{"browser":"dots"}}"#.utf8))
 expect(migratedDots.windowStripStyle == .compact && migratedDots.stripStyle(.browser) == .compact, "old Dots choices migrate to Compact")
-expect(WindowStripStyle.allCases == [.compact, .detailed, .expanding], "Compact, Detailed and Expand on hover are offered")
+expect(WindowStripStyle.allCases == [.compact, .detailed, .expanding, .line], "Compact, Detailed, Expand on hover and Line are offered")
 for (key, action) in StripKeyAction.bindings {
     expect(StripKeyAction.action(keyCode: key, hasModifiers: false, hovering: true) == action, "hovered bare arrows and number keys select the matching action")
     expect(StripKeyAction.action(keyCode: key, hasModifiers: false, hovering: false) == nil, "keyboard behavior outside a strip stays normal")
@@ -547,15 +566,111 @@ print("PASS: Expand on hover strips; \(checks) total model checks")
 let twoWide = WindowStripMetrics.measure(style: .detailed, count: 2, scale: 1, availableWidth: 3000)
 let sixWide = WindowStripMetrics.measure(style: .detailed, count: 6, scale: 1, availableWidth: 3000)
 let manyWide = WindowStripMetrics.measure(style: .detailed, count: 16, scale: 1, availableWidth: 3000)
-expect(twoWide.width == WindowStripMetrics.chipRoom(slots: 1) + 2 * WindowStripMetrics.chipWidth, "two windows get a short bar with no empty stretch")
-expect(twoWide.width < sixWide.width && sixWide.width <= 760 && manyWide.width == 760, "the bar grows with its windows up to a full-width bar")
+expect(twoWide.width == WindowStripMetrics.chipRoom(slots: 1) + 2 * WindowStripMetrics.chipLimit(scale: 1), "two windows get a short bar with no empty stretch")
+expect(twoWide.width < sixWide.width && sixWide.width <= WindowStripMetrics.barLimit(scale: 1) && manyWide.width == WindowStripMetrics.barLimit(scale: 1), "the bar grows with its windows up to a full-width bar")
 for count in 2...16 {
     let bar = WindowStripMetrics.measure(style: .detailed, count: count, scale: 1, availableWidth: 3000)
     let perChip = (bar.width - WindowStripMetrics.chipRoom(slots: 1)) / Double(count)
-    expect(perChip <= WindowStripMetrics.chipWidth + 0.001, "chips fill the bar without leaving a gap (\(count) windows)")
+    expect(perChip <= WindowStripMetrics.chipLimit(scale: 1) + 0.001, "chips fill the bar without leaving a gap (\(count) windows)")
     expect(bar.width >= WindowStripMetrics.measure(style: .expanding, count: count, scale: 1, availableWidth: 3000).width, "the expanded bar still covers the resting pill (\(count) windows)")
 }
+for scale in [0.8, 0.9, 1.0, 1.2, 1.5] {
+    expect(WindowStripMetrics.tabText(scale: scale) >= 10, "tab names are never under 10 points (Strip size \(Int(scale * 100))%)")
+    expect(abs(WindowStripMetrics.tabText(scale: scale) / WindowStripMetrics.chipLimit(scale: scale) - 9 / WindowStripMetrics.chipWidth) < 1e-9, "tabs widen with their text, so names show as many letters (\(Int(scale * 100))%)")
+    let bar = WindowStripMetrics.measure(style: .detailed, count: 6, scale: scale, availableWidth: 3000)
+    expect(bar.height == 32 * scale, "bigger tab text keeps the strip's height (\(Int(scale * 100))%)")
+}
+expect(WindowStripMetrics.tabText(scale: 1) == 11 && WindowStripMetrics.tabText(scale: 0.8) == 10, "tab names are 11 points at 100% and 10 at the smallest strip")
 print("PASS: detailed strips fit their windows; \(checks) total model checks")
+
+let macBookGrid = GridPreviewSize.fit(width: 1259, display: CGSize(width: 1512, height: 886))
+expect(macBookGrid.height == 470 && abs(macBookGrid.width / macBookGrid.height - 1512.0 / 886) < 1e-9, "a MacBook grid is drawn in the MacBook's shape, narrower instead of taller than 470 points")
+let ultrawideGrid = GridPreviewSize.fit(width: 988, display: CGSize(width: 5120, height: 1415))
+expect(ultrawideGrid.width == 988 && abs(ultrawideGrid.height - 988 * 1415.0 / 5120) < 1e-9, "an ultrawide grid fills the editor's width in the ultrawide's shape")
+expect(GridPreviewSize.fit(width: 0, display: CGSize(width: 1512, height: 886)).width == 0 && GridPreviewSize.fit(width: 900, display: .zero).height == 330, "the grid editor waits for a width and falls back without a display")
+print("PASS: the grid editor matches the display's shape; \(checks) total model checks")
+
+let macBookDisplay = CGRect(x: 0, y: 0, width: 1512, height: 982), ultrawideAbove = CGRect(x: -1804, y: -1440, width: 5120, height: 1440)
+expect(WindowDisplay.owner(of: CGRect(x: 1143, y: 529, width: 363, height: 855), displays: [macBookDisplay]) == 0, "a window hanging below the Dock still belongs to the MacBook")
+expect(WindowDisplay.owner(of: CGRect(x: 1400, y: 200, width: 800, height: 600), displays: [macBookDisplay]) == 0, "a window past the right edge still belongs to the MacBook")
+expect(WindowDisplay.owner(of: CGRect(x: 0, y: -900, width: 1200, height: 800), displays: [macBookDisplay, ultrawideAbove]) == 1, "a window on the ultrawide belongs to the ultrawide")
+expect(WindowDisplay.owner(of: CGRect(x: 100, y: -300, width: 1000, height: 800), displays: [macBookDisplay, ultrawideAbove]) == 0, "a window across both belongs to the one it covers most")
+expect(WindowDisplay.owner(of: CGRect(x: 3000, y: 3000, width: 400, height: 300), displays: [macBookDisplay]) == 0 && WindowDisplay.owner(of: .zero, displays: []) == nil, "a window off every display goes to the nearest one")
+print("PASS: windows belong to the display they hang off; \(checks) total model checks")
+
+expect(WindowStripMetrics.usesList(count: 7, scale: 0.8, availableWidth: 363), "seven terminals in a MacBook's narrow Terminal tile open as a list")
+expect(!WindowStripMetrics.usesList(count: 5, scale: 1, availableWidth: 1110) && !WindowStripMetrics.usesList(count: 1, scale: 1, availableWidth: 200), "a wide tile keeps its row of tabs, and one window needs no list")
+let narrowList = WindowStripMetrics.list(count: 7, scale: 0.8, availableWidth: 363)
+expect(narrowList.width >= 363 && abs(narrowList.height - (32 * 0.8 + 7 * WindowStripMetrics.listRow(scale: 0.8) + 8)) < 1e-9 && WindowStripMetrics.listRow(scale: 0.8) >= 22, "the list is at least as wide as its tile and has one line per window")
+expect(WindowStripMetrics.list(count: 3, scale: 1, availableWidth: 150).width >= 320, "a list on a tiny tile still shows whole names")
+expect(WindowStripMetrics.list(count: 40, scale: 1, availableWidth: 300).height == 32 + 16 * WindowStripMetrics.listRow(scale: 1) + 8, "the list shows at most 16 windows, like the row")
+let listNearBottom = StripPlacementGeometry.grown(rest: CGRect(x: 1180, y: 840, width: 190, height: 26), size: CGSize(width: 363, height: 188), bounds: CGRect(x: 0, y: 33, width: 1512, height: 879))
+expect(listNearBottom.maxY <= 912 + 1e-9 && listNearBottom.maxX <= 1512 && listNearBottom.width == 363, "a list near the bottom-right corner opens up and left, inside the screen")
+print("PASS: narrow strips open into a list of whole names; \(checks) total model checks")
+
+let fullBrowser = ZoneRect(CGRect(x: 0, y: 0, width: 1, height: 1)), floatTerminal = ZoneRect(CGRect(x: 0.75, y: 0, width: 0.25, height: 1))
+let overlaid = [Lane.browser.rawValue: fullBrowser, Lane.terminal.rawValue: floatTerminal]
+expect(!GridGeometry.valid(overlaid, lanes: [.browser, .terminal]) && GridGeometry.valid(overlaid, lanes: [.browser, .terminal], floating: [Lane.terminal.rawValue]), "a floating Terminal may sit over a full-screen Browser; two grid categories may not overlap")
+expect(!GridGeometry.valid([Lane.browser.rawValue: fullBrowser, Lane.terminal.rawValue: ZoneRect(CGRect(x: 0.8, y: 0, width: 0.3, height: 1))], lanes: [.browser, .terminal], floating: [Lane.terminal.rawValue]), "a floating category still stays on the display")
+let filledBeside = GridGeometry.filling(CGRect(x: 0.75, y: 0, width: 0.25, height: 1), rects: [Lane.browser.rawValue: ZoneRect(CGRect(x: 0, y: 0, width: 0.75, height: 1))])
+expect(filledBeside[Lane.browser.rawValue] == fullBrowser, "floating the Terminal beside a Browser makes the Browser fill the screen")
+let laptopGrid = [Lane.browser.rawValue: ZoneRect(CGRect(x: 0, y: 0, width: 0.6, height: 1)), Lane.messaging.rawValue: ZoneRect(CGRect(x: 0.6, y: 0.55, width: 0.4, height: 0.45))]
+let filledStack = GridGeometry.filling(CGRect(x: 0.6, y: 0, width: 0.4, height: 0.55), rects: laptopGrid)
+expect(filledStack[Lane.messaging.rawValue] == ZoneRect(CGRect(x: 0.6, y: 0, width: 0.4, height: 1)) && filledStack[Lane.browser.rawValue] == laptopGrid[Lane.browser.rawValue], "floating the top-right Terminal lets Messaging below it take the whole column, not the Browser")
+let noSide = [Lane.browser.rawValue: ZoneRect(CGRect(x: 0, y: 0, width: 0.5, height: 1)), Lane.messaging.rawValue: ZoneRect(CGRect(x: 0.5, y: 0.5, width: 0.25, height: 0.5))]
+expect(GridGeometry.filling(CGRect(x: 0.5, y: 0, width: 0.25, height: 0.4), rects: noSide) == noSide, "a hole no neighbor lines exactly stays a hole")
+let grownFloat = GridGeometry.resizedAlone(CGRect(x: 0.75, y: 0, width: 0.25, height: 1), edge: .left, dx: -0.1, dy: 0, snap: true)
+expect(abs(grownFloat.minX - 0.65625) < 1e-9 && abs(grownFloat.maxX - 1) < 1e-9 && grownFloat.height == 1, "a floating category's left edge moves alone, on the snap grid")
+let shrunkFloat = GridGeometry.resizedAlone(CGRect(x: 0.75, y: 0, width: 0.25, height: 1), edge: .bottom, dx: 0, dy: -2, snap: false)
+expect(abs(shrunkFloat.height - 0.06) < 1e-9 && shrunkFloat.minY == 0, "a floating category never shrinks below the smallest region")
+let overlayLanes: [Lane] = [.browser, .terminal, .messaging]
+let overlayRects = PresetShape.overlay.rects(lanes: overlayLanes, main: .browser, windows: [.browser: 3, .terminal: 7, .messaging: 2])
+let overlayFloating = PresetShape.overlay.floating(lanes: overlayLanes, main: .browser)
+expect(overlayRects[Lane.browser.rawValue] == fullBrowser && Set(overlayFloating) == [Lane.terminal.rawValue, Lane.messaging.rawValue] && GridGeometry.valid(overlayRects, lanes: overlayLanes, floating: Set(overlayFloating)), "Overlay: the main category fills the screen and the rest float over it")
+expect(PresetShape.shapes(for: .standard) == [.mainSide, .overlay, .columns] && PresetShape.shapes(for: .wide).contains(.focus) && PresetShape.columns.floating(lanes: overlayLanes, main: .browser).isEmpty, "a MacBook screen offers no three-band Focus; only Overlay floats anything")
+var floatingSettings = Settings()
+floatingSettings.hiddenLanes = []; floatingSettings.shelvedLanes = Lane.allCases.filter { $0 != .browser && $0 != .terminal }.map(\.rawValue)
+floatingSettings.customRects = overlaid; floatingSettings.floatingLanes = [Lane.terminal.rawValue]
+let floatingRoundTrip = try! JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(floatingSettings))
+expect(floatingRoundTrip.floatingLanes == [Lane.terminal.rawValue] && floatingRoundTrip.customRects == overlaid, "a floating Terminal over a full-screen Browser survives saving and loading")
+let perDisplay = floatingSettings.displayLayout(kind: .standard)
+var reapplied = Settings(); reapplied.apply(perDisplay)
+expect(reapplied.floatingLanes == [Lane.terminal.rawValue] && floatingSettings.laptopLayout().floatingLanes == [], "each display keeps its own floating categories; a fresh laptop grid floats nothing")
+let olderSettings = try! JSONDecoder().decode(Settings.self, from: Data(#"{"customRects":{"browser":{"x":0,"y":0,"width":0.75,"height":1},"terminal":{"x":0.75,"y":0,"width":0.25,"height":1}},"hiddenLanes":[],"shelvedLanes":["desktop","messaging","simulator","preview","media"]}"#.utf8))
+expect(olderSettings.floatingLanes.isEmpty && olderSettings.customRects.count == 2, "settings from before floating load unchanged")
+print("PASS: categories float over the grid; \(checks) total model checks")
+
+var leaveAloneSettings = Settings()
+leaveAloneSettings.ignoredApps = ["com.example.chatbot", "com.example.agent"]; leaveAloneSettings.stripList = .always
+let leaveAloneBack = try! JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(leaveAloneSettings))
+expect(leaveAloneBack.ignoredApps == ["com.example.chatbot", "com.example.agent"] && leaveAloneBack.stripList == .always, "apps left alone and the window-list choice survive saving and loading")
+expect(olderSettings.ignoredApps.isEmpty && olderSettings.stripList == .narrow && Settings().stripList == .narrow, "older settings leave nothing alone and open lists only on narrow tiles")
+expect(StripListMode.allCases.map(\.title) == ["Narrow tiles", "Always", "Off"], "the window list setting reads Narrow tiles, Always, Off")
+print("PASS: leave-alone apps and the window list setting; \(checks) total model checks")
+
+let idleLine = WindowStripMetrics.measure(style: .line, count: 7, scale: 0.8, availableWidth: 363)
+expect(idleLine.height == 14 * 0.8 && abs(idleLine.width - 7 * 16 * 0.8) < 1e-9, "an idle Line is a thin bar with a segment per window")
+expect(WindowStripMetrics.measure(style: .line, count: 2, scale: 1, availableWidth: 900).width == 64 && WindowStripMetrics.measure(style: .line, count: 40, scale: 1, availableWidth: 900).width == 180 && WindowStripMetrics.measure(style: .line, count: 7, scale: 1, availableWidth: 50).width == 50, "a Line stays easy to hover, never runs long, and fits its tile")
+expect(WindowStripStyle.line.expandsOnHover && WindowStripStyle.expanding.expandsOnHover && !WindowStripStyle.compact.expandsOnHover && !WindowStripStyle.detailed.expandsOnHover, "Line and Expand on hover open while hovered; Compact and Detailed do not")
+expect(WindowStripMetrics.usesList(count: 7, scale: 0.8, availableWidth: 363) && WindowStripStyle.allCases.map(\.title) == ["Compact", "Detailed", "Expand on hover", "Line"], "Line is the fourth strip style and opens the same list on narrow tiles")
+var lineSettings = Settings(); lineSettings.windowStripStyle = .line; lineSettings.categoryStripStyles = [Lane.terminal.rawValue: "line"]
+let lineBack = try! JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(lineSettings))
+expect(lineBack.windowStripStyle == .line && lineBack.stripStyle(.terminal) == .line, "the Line style is saved for every strip or one category")
+print("PASS: Line strips; \(checks) total model checks")
+
+expect(ActivationRestore.shouldRestore(front: "terminal-b-front", selected: "terminal-a-selected", visible: [], clickedWindow: false, lanesAsked: false), "Command+Tab to Ghostty brings back the Terminal tab you were on, not the other Ghostty's window")
+expect(!ActivationRestore.shouldRestore(front: "terminal-b-front", selected: "terminal-a-selected", visible: [], clickedWindow: true, lanesAsked: false), "clicking a window keeps the window you clicked")
+expect(!ActivationRestore.shouldRestore(front: "terminal-b-front", selected: "terminal-a-selected", visible: [], clickedWindow: false, lanesAsked: true), "a switch Lanes asked for is left alone")
+expect(!ActivationRestore.shouldRestore(front: "a", selected: "a", visible: [], clickedWindow: false, lanesAsked: false) && !ActivationRestore.shouldRestore(front: "right", selected: "left", visible: ["right"], clickedWindow: false, lanesAsked: false) && !ActivationRestore.shouldRestore(front: nil, selected: "a", visible: [], clickedWindow: false, lanesAsked: false), "nothing changes when the right tab is already in front, or the front window shows in the category's other pane")
+var activationClock = UserInputClock()
+activationClock.key(modified: true, sourcePID: 0, at: 10)
+expect(!activationClock.mouseDown(within: 0.6, at: 10.1), "Command+Tab is a key press, not a click on a window")
+activationClock.pointer(held: true, sourcePID: 0, at: 20)
+expect(activationClock.mouseDown(within: 0.6, at: 20.2) && !activationClock.mouseDown(within: 0.6, at: 21), "a real click counts for a moment after it happens")
+activationClock.pointer(held: true, sourcePID: 4242, at: 30)
+expect(!activationClock.mouseDown(within: 0.6, at: 30.1), "an agent's synthetic click is not your click")
+print("PASS: Command+Tab shows the tab you were on; \(checks) total model checks")
+
 
 var flick = LaneScrollAccumulator(), flickSteps = 0, flickTime = 30.0
 for _ in 0..<4 { flickTime += 0.012; if flick.consume(delta: -9, precise: true, time: flickTime) == 1 { flickSteps += 1 } }
@@ -578,7 +693,31 @@ expect(TileMembership.category(of: terminalBottom, tiles: layoutTiles) == .termi
 expect(TileMembership.category(of: CGRect(x: 1813, y: 263, width: 1494, height: 876), tiles: layoutTiles) == nil, "a centered floating window belongs to no category")
 expect(TileMembership.category(of: CGRect(x: 12, y: 371, width: 787, height: 600), tiles: layoutTiles) == nil, "a window hanging half out of a pane is not counted there")
 expect(TileMembership.category(of: CGRect(x: 3000, y: 300, width: 1000, height: 600), tiles: layoutTiles) == nil, "a window straddling two categories belongs to neither")
-print("PASS: categories follow where windows sit; \(checks) total model checks")
+var clock = UserInputClock()
+expect(!clock.userActive(at: 100, buttonDown: false), "with no input, a move is not yours")
+clock.pointer(held: true, sourcePID: 4242, at: 100)
+expect(!clock.userActive(at: 100.1, buttonDown: true), "an agent's synthetic drag is not your input")
+clock.key(modified: true, sourcePID: 0, at: 100)
+expect(!clock.userActive(at: 101, buttonDown: false), "a shortcut a second ago no longer explains a move")
+clock.key(modified: false, sourcePID: 0, at: 102)
+expect(!clock.userActive(at: 102.1, buttonDown: false), "plain typing never moves windows")
+clock.key(modified: true, sourcePID: 0, at: 103)
+expect(clock.userActive(at: 103.3, buttonDown: false), "your window shortcut moments ago explains a move")
+clock.pointer(held: true, sourcePID: 0, at: 110)
+expect(clock.userActive(at: 115, buttonDown: true), "a window follows your drag for as long as you hold the button")
+expect(!clock.userActive(at: 115, buttonDown: false), "a missed release never leaves a stale drag behind")
+clock.pointer(held: false, sourcePID: 0, at: 116)
+expect(clock.userActive(at: 116.5, buttonDown: false) && !clock.userActive(at: 117, buttonDown: false), "your click explains a move for a moment, then stops")
+var busyHands = UserInputClock()
+busyHands.pointer(held: nil, sourcePID: 0, at: 200)
+expect(!busyHands.causedMove(at: 200.2, buttonDown: false, pointerOnWindow: false, pointerInItsMenuBar: false), "your click in another app does not cover an agent moving this window")
+expect(busyHands.causedMove(at: 200.2, buttonDown: false, pointerOnWindow: true, pointerInItsMenuBar: false), "your click on the window's zoom button or title bar explains its move")
+expect(busyHands.causedMove(at: 200.2, buttonDown: false, pointerOnWindow: false, pointerInItsMenuBar: true), "your choice in its app's Window menu explains its move")
+busyHands.key(modified: true, sourcePID: 0, at: 300)
+expect(busyHands.causedMove(at: 300.2, buttonDown: false, pointerOnWindow: false, pointerInItsMenuBar: false), "a window-manager shortcut can move any window")
+let guardDefaults = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
+expect(guardDefaults.keepLayout && Settings.firstRun.keepLayout, "the layout guard is on by default, for existing and new installs")
+print("PASS: categories follow where windows sit; only your input rearranges; \(checks) total model checks")
 
 let restingAtEdge = StripPlacementGeometry.frame(size: CGSize(width: 150, height: 26), region: CGRect(x: 4209, y: 42, width: 899, height: 1346), bounds: stripScreen, saved: StripPosition(x: 1.2, y: 0.02))
 expect(restingAtEdge.maxX <= stripScreen.maxX - StripPlacementGeometry.edgeMargin && restingAtEdge.minX >= stripScreen.minX, "a resting strip dragged toward the edge also keeps the margin")
@@ -646,8 +785,9 @@ for n in 1...presetLanes.count {
     for shape in PresetShape.allCases {
         let main = lanes[min(1, n - 1)]
         let r = shape.rects(lanes: lanes, main: main, windows: counts)
-        expect(GridGeometry.valid(r, lanes: lanes), "\(shape.title) fits \(n) categories with no overlap")
-        expect(abs(r.values.reduce(0.0) { $0 + $1.width * $1.height } - 1) < 0.0001, "\(shape.title) uses the whole display for \(n) categories")
+        let floats = Set(shape.floating(lanes: lanes, main: main))
+        expect(GridGeometry.valid(r, lanes: lanes, floating: floats), "\(shape.title) fits \(n) categories with no overlap")
+        expect(abs(r.filter { !floats.contains($0.key) }.values.reduce(0.0) { $0 + $1.width * $1.height } - 1) < 0.0001, "\(shape.title) uses the whole display for \(n) categories")
         if shape != .columns && n > 1 {
             let area = { (l: Lane) in (r[l.rawValue]?.width ?? 0) * (r[l.rawValue]?.height ?? 0) }
             expect(lanes.allSatisfy { $0 == main || area($0) < area(main) }, "\(shape.title) gives the main category the most room")
@@ -753,3 +893,41 @@ for (id, name) in [("com.adobe.PremierePro.25", "Adobe Premiere Pro 2025"), ("co
     expect(Classifier.lane(bundleID: id, appName: name, title: "", rules: [:]) == .preview, "\(name) goes in Previews with the other video apps")
 }
 print("PASS: new installs start with Browser alone; video editors share one category; \(checks) total model checks")
+
+let identityFrame = CGRect(x: 10, y: 20, width: 600, height: 400)
+expect(WindowVisibility.matches(number: 101, onScreen: [101], frame: identityFrame, fallbackFrames: []), "exact window identity is visible even during a frame transition")
+expect(!WindowVisibility.matches(number: 102, onScreen: [101], frame: identityFrame, fallbackFrames: [identityFrame]), "a hidden tab sharing the visible tab's frame is not invented as an on-screen window")
+expect(WindowVisibility.matches(number: nil, onScreen: [], frame: identityFrame, fallbackFrames: [identityFrame]), "apps without a window-server ID retain a full-frame fallback")
+expect(!WindowVisibility.matches(number: nil, onScreen: [], frame: identityFrame, fallbackFrames: [CGRect(x: 10, y: 20, width: 1000, height: 700)]), "a shared origin alone never identifies a visible window")
+let identityOrder = StackOrder.positions(windows: [SeenWindow(id: "back", pid: 22, frame: identityFrame, number: 102), SeenWindow(id: "front", pid: 22, frame: identityFrame, number: 101)], onScreen: [(22, identityFrame), (22, identityFrame)], numbers: [101: 0, 102: 1])
+expect(identityOrder == ["front": 0, "back": 1], "restart adoption uses server IDs when Arc's AX order differs from its visible order")
+expect(StackOrder.positions(windows: [SeenWindow(id: "hidden", pid: 22, frame: identityFrame, number: 103)], onScreen: [(22, identityFrame)], numbers: [101: 0]).isEmpty, "restart never mistakes a hidden native tab for a shown window")
+expect(TabSwitch.pairs(vanished: [SeenWindow(id: "old-a", pid: 22, frame: identityFrame), SeenWindow(id: "old-b", pid: 22, frame: identityFrame)], appeared: [SeenWindow(id: "new", pid: 22, frame: identityFrame)]).isEmpty, "ambiguous native-tab replacements never steal another window's category")
+expect(TabSwitch.pairs(vanished: [SeenWindow(id: "old", pid: 22, frame: identityFrame)], appeared: [SeenWindow(id: "new-a", pid: 22, frame: identityFrame), SeenWindow(id: "new-b", pid: 22, frame: identityFrame)]).isEmpty, "two newly appeared windows in one spot are not guessed to be a tab switch")
+expect(FocusConfirm.covered(before: ["desktop#0": 1, "desktop#1": 1, "browser#0": 5], after: ["desktop#0": 2, "desktop#1": 2, "browser#0": 6], wanted: 3, sameApp: [2, 3, 6], excluding: ["browser#0"]) == [1], "focus restoration deduplicates covered windows and excludes the pane intentionally being switched")
+var typingClock = UserInputClock()
+typingClock.key(modified: false, sourcePID: 0, at: 10)
+expect(typingClock.pressed(since: 9) && !typingClock.shortcutActive(at: 10.1), "plain typing stops focus correction without being mistaken for a resize shortcut")
+typingClock.key(modified: true, sourcePID: 44, at: 20)
+expect(!typingClock.pressed(since: 15), "synthetic key presses are not treated as a new physical selection")
+for capacity in 1...4 {
+    let ids = (0..<12).map { "queue-\($0)" }
+    let foreground = Array(ids.prefix(capacity))
+    let full = Layout.stack(ids: ids, foreground: foreground, in: identityFrame, gap: 12, lane: .browser, slotCount: capacity)
+    for id in ids {
+        let incremental = Layout.stack(ids: ids, foreground: foreground, in: identityFrame, gap: 12, lane: .browser, onlyIDs: [id], slotCount: capacity)
+        expect(incremental.frames[id] == full.frames[id] && incremental.frames.count == 1, "incremental placement and the layout guard agree on every queued window's tile")
+    }
+}
+print("PASS: exact window discovery/restart identities, conservative native-tab inheritance, focus cancellation and pane scoping, stable incremental queues; \(checks) total model checks")
+expect(WindowPlacement.fits(identityFrame, in: identityFrame), "a correctly placed window needs no guard repair")
+expect(WindowPlacement.fits(CGRect(x: 10, y: 20, width: 400, height: 300), in: identityFrame), "a fixed-size app fitting inside its tile must not be resized repeatedly")
+expect(!WindowPlacement.fits(identityFrame.offsetBy(dx: 30, dy: 0), in: identityFrame), "an app moved out of its assigned origin still needs repair")
+expect(!WindowPlacement.fits(CGRect(x: 10, y: 20, width: 1000, height: 400), in: identityFrame), "an oversized window is not treated as fitting")
+print("PASS: fixed-size window guard avoids resize loops; \(checks) total model checks")
+var contextClock = UserInputClock()
+contextClock.press(sourcePID: 0, at: 30)
+expect(contextClock.pressed(since: 29) && !contextClock.buttonHeld, "a context-menu or middle-button press cancels focus repair without inventing a held left-button drag")
+contextClock.press(sourcePID: 42, at: 40)
+expect(!contextClock.pressed(since: 35), "synthetic context clicks cannot become physical presses")
+print("PASS: all physical button presses cancel old focus requests; \(checks) total model checks")

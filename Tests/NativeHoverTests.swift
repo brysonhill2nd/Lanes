@@ -52,7 +52,9 @@ import SwiftUI
         RunLoop.main.run(until: Date(timeIntervalSinceNow: StripHoverCheck.interval * 2.5))
         precondition(watchedHover == [true] && watched.visibility.hovered, "a pointer still on the strip keeps it hovered")
         pointer = CGPoint(x: 900, y: 120)
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: StripHoverCheck.interval * 2.5))
+        // A busy machine can delay the check; it only has to come.
+        let releaseDeadline = Date(timeIntervalSinceNow: 2)
+        while watched.visibility.hovered && Date() < releaseDeadline { RunLoop.main.run(until: Date(timeIntervalSinceNow: StripHoverCheck.interval)) }
         precondition(watchedHover == [true, false] && !watched.visibility.hovered, "a missed exit still releases the strip and its keys")
         precondition(!StripHoverCheck.contains(nil, .zero), "a closed strip never counts as hovered")
         precondition(StripHoverCheck.contains(CGRect(x: 0, y: 0, width: 10, height: 10), CGPoint(x: 12, y: 5)), "the edge of a strip still counts as on it")

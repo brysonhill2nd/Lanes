@@ -6,7 +6,13 @@ import AppKit
 final class StripVisibility: ObservableObject {
     @Published private(set) var opacity = 1.0
     // Lowest idle opacity. Strips drawn over windows stay faintly visible.
-    @Published var floor = 0.0
+    @Published private(set) var floor = 0.0
+    // Set while SwiftUI updates the strip, so a change is published just after
+    // that update instead of during it.
+    func setFloor(_ value: Double) {
+        guard value != floor else { return }
+        DispatchQueue.main.async { [weak self] in self?.floor = value }
+    }
     var visible: Bool { opacity > 0 }
     private var fadeTimer: Timer?
     private var pending: DispatchWorkItem?

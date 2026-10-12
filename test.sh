@@ -13,3 +13,6 @@ build/app-discovery-tests
 
 xcrun swiftc -swift-version 5 -module-cache-path build/test-module-cache Sources/Model.swift Sources/HoverScrollView.swift Tests/NativeHoverTests.swift -o build/native-hover-tests -framework AppKit -framework SwiftUI
 build/native-hover-tests
+
+xcrun swiftc -swift-version 5 -module-cache-path build/test-module-cache Sources/Model.swift Sources/WindowManager.swift Tests/WindowFocusTests.swift -o build/window-focus-tests -framework AppKit -framework ApplicationServices
+build/window-focus-tests

@@ -10,6 +10,9 @@ import QuartzCore
     var switcher: NSPanel?
     private var stripAnimators: [Lane: StripFrameAnimator] = [:]
     var overlays: [NSPanel] = []
+    var dropZones: [NSPanel] = []
+    var dropZoneWatch: Timer?
+    var dropZoneReleased = 0
     var laneControls: [NSPanel] = []
     var laneControlByID: [Lane: NSPanel] = [:]
     var hoverHotkeys: [EventHotKeyRef] = []
@@ -48,6 +51,7 @@ import QuartzCore
         manager.isBoardVisible = { [weak self] in self?.window.isVisible ?? false }
         manager.onKeepBoard = { [weak self] in NSApp.activate(); self?.window.makeKeyAndOrderFront(nil) }
         manager.onOverlay = { [weak self] frames in self?.showOverlay(frames) }
+        manager.onTabDrag = { [weak self] id in self?.tabDragChanged(id) }
         manager.onLaneControls = { [weak self] in self?.showLaneControls() }
         manager.onHideLaneControls = { [weak self] in self?.hideLaneControls() }
         manager.onSwitcher = { [weak self] in self?.toggleSwitcher() }
@@ -190,9 +194,10 @@ import QuartzCore
         }
         // Local key events (including app-directed accessibility automation) can
         // bypass Carbon's global dispatcher. Handle the same chords in the board.
-        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .otherMouseDown]) { [weak self] event in
             let handled = MainActor.assumeIsolated { () -> Bool in
                 guard let self else { return false }
+                self.manager.noteInput(event)
                 self.observeCommandTap(event)
                 guard event.type == .keyDown else { return false }
                 let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
@@ -240,8 +245,12 @@ import QuartzCore
         if let globalTapMonitor { NSEvent.removeMonitor(globalTapMonitor); self.globalTapMonitor = nil }
         commandTap.cancel()
         guard manager.trusted else { return }
-        globalTapMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { [weak self] event in
-            MainActor.assumeIsolated { self?.observeCommandTap(event) }
+        // Key presses and clicks also tell the layout guard which moves are yours.
+        globalTapMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+            MainActor.assumeIsolated {
+                self?.manager.noteInput(event)
+                if event.type == .flagsChanged || event.type == .keyDown { self?.observeCommandTap(event) }
+            }
         }
     }
     func observeCommandTap(_ event: NSEvent) {
@@ -321,7 +330,7 @@ import QuartzCore
                 if manager.draggingStrip != lane {
                     let animator = stripAnimators[lane] ?? StripFrameAnimator()
                     stripAnimators[lane] = animator
-                    animator.move(panel, to: cocoaFrame, animated: manager.settings.stripStyle(lane) == .expanding)
+                    animator.move(panel, to: cocoaFrame, animated: manager.settings.stripStyle(lane).expandsOnHover)
                 }
             }
             else {
@@ -353,6 +362,41 @@ import QuartzCore
         let current = overlays
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { current.forEach { $0.close() } }
     }
+    // While a strip tab is dragged, every other category gets an invisible drop
+    // zone over its region; only the tab shows under the mouse. The zones close
+    // when the drop lands or the mouse button comes up.
+    func tabDragChanged(_ id: String?) {
+        // A zone can be mid-drop when this runs, so it closes on the next turn.
+        let old = dropZones; dropZones.removeAll()
+        old.forEach { $0.orderOut(nil) }
+        DispatchQueue.main.async { old.forEach { $0.close() } }
+        dropZoneWatch?.invalidate(); dropZoneWatch = nil
+        guard let id, let source = manager.windows.first(where: { $0.id == id })?.lane else { return }
+        let mainHeight = NSScreen.screens.first?.frame.height ?? 0
+        for lane in manager.enabledLanes where lane != source {
+            let frame = manager.rawLaneFrame(lane)
+            let panel = NSPanel(contentRect: NSRect(x: frame.minX, y: mainHeight - frame.maxY, width: frame.width, height: frame.height), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false; panel.isReleasedWhenClosed = false
+            panel.ignoresMouseEvents = false
+            // Under the strips, above every app window.
+            panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue - 1)
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.title = "\(manager.name(lane)) — Lanes drop zone"
+            panel.contentView = NSHostingView(rootView: DropZoneView { [weak self] values in self?.manager.dropTab(values, into: lane) ?? false })
+            panel.orderFrontRegardless(); dropZones.append(panel)
+        }
+        let started = ProcessInfo.processInfo.systemUptime
+        dropZoneReleased = 0
+        dropZoneWatch = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // A drop outside every zone never reports back; the released
+                // button does. Two checks in a row let a drop land first.
+                self.dropZoneReleased = NSEvent.pressedMouseButtons & 1 == 0 ? self.dropZoneReleased + 1 : 0
+                if self.dropZoneReleased >= 2 || ProcessInfo.processInfo.systemUptime - started > 60 { self.manager.endTabDrag() }
+            }
+        }
+    }
 }
 
 struct SwitcherView: View {
@@ -379,6 +423,16 @@ struct SwitcherView: View {
             .clipShape(RoundedRectangle(cornerRadius: 12)).overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.white.opacity(0.15))).padding(2)
     }
 }
+// Nothing to see: the window server skips fully clear pixels, so the zone is
+// filled just enough to receive the drop.
+struct DropZoneView: View {
+    let drop: ([String]) -> Bool
+    var body: some View {
+        Color.black.opacity(0.01).contentShape(Rectangle())
+            .dropDestination(for: String.self) { values, _ in drop(values) }
+    }
+}
+
 struct OverlayView: View {
     let lane: Lane
     let name: String

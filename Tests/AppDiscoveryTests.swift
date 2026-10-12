@@ -91,6 +91,31 @@ import ApplicationServices
         tabManager.show(terminalWindows[1], inPane: 1)
         precondition(tabManager.visibleItems(.terminal).map(\.id) == ["terminal-test-0", "terminal-test-1"], "Show in Right on the left window swaps it over instead of doing nothing")
         precondition(tabManager.activeSlot[.terminal] == 1, "the moved window stays selected in its new pane")
+        tabManager.windowChanged("terminal-test-0", userActive: false, at: 1)
+        precondition(!tabManager.userMoved.contains("terminal-test-0"), "a move that was not yours is never learned")
+        tabManager.windowChanged("terminal-test-0", userActive: true, at: 2)
+        precondition(tabManager.userMoved.contains("terminal-test-0"), "your own move is remembered for the next category check")
+        tabManager.settings.keepLayout = false
+        precondition(!tabManager.guards("terminal-test-0"), "with Keep windows in their tiles off, nothing is put back")
+        tabManager.settings.keepLayout = true
+        precondition(!tabManager.guards("not-a-window"), "only windows Lanes arranged are guarded")
+        let paneWindow = tabManager.windows.first { $0.id == tabManager.slotIDs(.terminal)[0] }!
+        let paneTiles = Layout.tiles(in: tabManager.laneFrame(.terminal), count: tabManager.settings.capacity(.terminal), gap: tabManager.settings.gap, lane: .terminal)
+        precondition(tabManager.expectedFrame(paneWindow) == paneTiles[0], "a window put back returns to exactly its pane")
+        let dropManager = WindowManager(settingsFile: fixture.appendingPathComponent("drops.json"), startPolling: false)
+        dropManager.trusted = false
+        dropManager.windows = terminalWindows
+        var dragEvents: [String?] = []
+        dropManager.onTabDrag = { dragEvents.append($0) }
+        let otherLane = dropManager.enabledLanes.first { $0 != .terminal }!
+        precondition(dropManager.beginTabDrag(terminalWindows[2]) == "tab:terminal-test-2" && dropManager.draggedTab == "terminal-test-2", "dragging a strip tab carries that window")
+        precondition(!dropManager.dropTab(["lane:" + otherLane.rawValue], into: otherLane), "only strip tabs can be dropped on a category")
+        precondition(dropManager.draggedTab == nil && dragEvents == ["terminal-test-2", nil], "any drop closes the drop zones")
+        precondition(dropManager.dropTab(["tab:terminal-test-2"], into: otherLane))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        precondition(dropManager.items(otherLane).map(\.id) == ["terminal-test-2"] && dropManager.items(.terminal).count == 3, "a tab dropped on another category moves the window there")
+        precondition(dropManager.settings.windowCategories["terminal-test-2"] == otherLane.rawValue, "the new category survives a restart")
+        precondition(dropManager.dropTab(["tab:terminal-test-3"], into: .terminal, before: terminalWindows[0]) && dropManager.items(.terminal).first?.id == "terminal-test-3", "a tab dropped in its own strip only reorders")
         precondition(tabManager.saveGridLayout(name: "My work"))
         let savedWork = tabManager.settings.savedLayouts.last!
         let workRects = tabManager.layoutRects()
@@ -237,6 +262,34 @@ import ApplicationServices
         outside.minimized = false
         _ = recovery.movePreservingOriginal(outside, to: CGRect(x: 300, y: 300, width: 400, height: 300))
         precondition(recovery.snapshot.count == 1 && recovery.snapshot[outside.id]?.frame == originalFrame && recovery.snapshot[outside.id]?.minimized == true, "repeated moves never replace the first Restore snapshot")
+        let isolation = WindowManager(settingsFile: fixture.appendingPathComponent("preset-isolation.json"), startPolling: false)
+        isolation.trusted = false
+        isolation.windows = terminalWindows
+        let isolatedIDs = Set(terminalWindows.map(\.id))
+        let fullGrid = isolation.currentGridLayout(name: "Full grid")
+        let browserOnly = SavedGridLayout(name: "Browser only", rects: ["browser": ZoneRect(CGRect(x: 0, y: 0, width: 1, height: 1))], capacities: ["browser": 1], lanes: ["browser"], gap: 12, categories: [], categoryNames: [:], windowCategories: [:])
+        isolation.loadGridLayout(browserOnly)
+        precondition(isolation.items(.browser).allSatisfy { !isolatedIDs.contains($0.id) } && isolation.outsideGrid.filter { isolatedIDs.contains($0.id) }.count == terminalWindows.count, "loading a Browser-only preset shelves terminals instead of relabeling them Browser")
+        precondition(isolation.outsideGrid.filter { isolatedIDs.contains($0.id) }.allSatisfy { $0.lane == .terminal }, "shelved windows keep their actual categories")
+        isolation.loadGridLayout(fullGrid)
+        precondition(isolation.items(.terminal).filter { isolatedIDs.contains($0.id) }.count == terminalWindows.count && isolation.outsideGrid.allSatisfy { !isolatedIDs.contains($0.id) }, "restoring a preset restores shelved category membership without rediscovery")
+        isolation.undoLayout()
+        precondition(isolation.items(.browser).allSatisfy { !isolatedIDs.contains($0.id) } && isolation.outsideGrid.filter { isolatedIDs.contains($0.id) }.count == terminalWindows.count, "Undo layout preserves the same category isolation")
+        print("PASS: preset and Undo category isolation, with shelved windows retained")
+        let nativeTabs = WindowManager(settingsFile: fixture.appendingPathComponent("native-tabs.json"), startPolling: false)
+        nativeTabs.trusted = true
+        var originalTab = ManagedWindow(id: "native-old", element: AXUIElementCreateApplication(0), pid: 0, bundleID: "com.mitchellh.ghostty", appName: "Ghostty", title: "First project", icon: nil, frame: CGRect(x: 150, y: 170, width: 900, height: 700), minimized: false, lane: .terminal)
+        nativeTabs.capture(originalTab)
+        let beforeTiling = originalTab.frame
+        originalTab.frame = nativeTabs.laneFrame(.terminal)
+        nativeTabs.windows = [originalTab]
+        _ = nativeTabs.apply(.terminal, raiseWindows: false) // AX PID 0 cannot move a real window.
+        let newTab = ManagedWindow(id: "native-new", element: AXUIElementCreateApplication(0), pid: 0, bundleID: originalTab.bundleID, appName: "Ghostty", title: "Second project", icon: nil, frame: originalTab.frame, minimized: false, lane: .terminal)
+        nativeTabs.windows = [newTab]
+        nativeTabs.adoptTabSwitches(previous: [originalTab])
+        precondition(nativeTabs.snapshot[newTab.id]?.frame == beforeTiling, "a new native tab inherits its window group's original Restore frame, not the tiled frame")
+        precondition(nativeTabs.slotIDs(.terminal).contains(newTab.id), "native tab switching retains the group's exact pane")
+        print("PASS: native-tab Restore snapshot inheritance")
         print("PASS: draft saving, preset preview/cancel, shared Apply/Organize commits, added categories, restart persistence, and uncategorized-window recovery")
         print("PASS: running-app discovery, named categories, shelf drag removal/restore, preserved assignments, drop placement, last-category protection, and hover state")
         print("Live discovery: \(manager.runningApps.count) running apps; window control granted: \(trusted)")

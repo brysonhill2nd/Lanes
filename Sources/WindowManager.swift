@@ -17,9 +17,13 @@ enum FrontProcess {
         guard let setFront, let getPSN else { return false }
         var psn = ProcessSerialNumber()
         guard getPSN(pid, &psn) == 0 else { return false }
+        guard let windowID = windowID(window) else { return false }
+        return setFront(&psn, windowID, 0x200) == 0
+    }
+    static func windowID(_ window: AXUIElement) -> UInt32? {
         var windowID: UInt32 = 0
-        if let getWindow { _ = getWindow(window, &windowID) }
-        return setFront(&psn, windowID, 0x200) == 0  // 0x200: user generated
+        guard let getWindow, getWindow(window, &windowID) == 0, windowID != 0 else { return nil }
+        return windowID
     }
 }
 import ApplicationServices
@@ -52,12 +56,77 @@ struct SavedWindow {
     let minimized: Bool
 }
 
+struct FocusWindowInfo {
+    let number: UInt32
+    let pid: pid_t
+    let frame: CGRect
+}
+
+// Injectable so regression tests can reproduce app activation reordering
+// windows without sending input to, or moving, the real desktop.
+struct WindowFocusAccess {
+    var frontPID: () -> pid_t?
+    var windowID: (ManagedWindow) -> UInt32?
+    var stack: () -> [FocusWindowInfo]
+    var prepare: (ManagedWindow) -> Void
+    var raise: (ManagedWindow) -> Bool
+    var activate: (ManagedWindow) -> Bool
+    var unminimize: (ManagedWindow) -> Void
+
+    static var native: Self {
+        Self(frontPID: { NSWorkspace.shared.frontmostApplication?.processIdentifier },
+             windowID: { FrontProcess.windowID($0.element) },
+             stack: {
+                 let info = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
+                 return info.compactMap { item in
+                     guard (item[kCGWindowLayer as String] as? Int) == 0,
+                           let number = item[kCGWindowNumber as String] as? UInt32,
+                           let pid = item[kCGWindowOwnerPID as String] as? pid_t,
+                           let bounds = item[kCGWindowBounds as String] as? [String: CGFloat],
+                           let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return nil }
+                     return FocusWindowInfo(number: number, pid: pid, frame: frame)
+                 }
+             }, prepare: { window in
+                 // Activation normally raises an app's main/key windows. Ask
+                 // for the exact window first, including apps with many panes.
+                 var settable = DarwinBoolean(false)
+                 if AXUIElementIsAttributeSettable(window.element, kAXMainAttribute as CFString, &settable) == .success, settable.boolValue {
+                     _ = AXUIElementSetAttributeValue(window.element, kAXMainAttribute as CFString, kCFBooleanTrue)
+                 }
+                 let app = AXUIElementCreateApplication(window.pid)
+                 AXUIElementSetMessagingTimeout(app, 0.2)
+                 if AXUIElementIsAttributeSettable(app, kAXFocusedWindowAttribute as CFString, &settable) == .success, settable.boolValue {
+                     _ = AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, window.element)
+                 }
+             }, raise: { AXUIElementPerformAction($0.element, kAXRaiseAction as CFString) == .success },
+             activate: { window in
+                 guard let app = NSRunningApplication(processIdentifier: window.pid) else { return false }
+                 NSApp?.yieldActivation(to: app)
+                 return app.activate() || FrontProcess.bring(pid: window.pid, window: window.element)
+             }, unminimize: { _ = AXUIElementSetAttributeValue($0.element, kAXMinimizedAttribute as CFString, kCFBooleanFalse) })
+    }
+}
+
 func axValue(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
     var value: CFTypeRef?
     guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
     return value
 }
 func axBool(_ element: AXUIElement, _ attribute: String) -> Bool { (axValue(element, attribute) as? Bool) ?? false }
+func axButtonEnabled(_ element: AXUIElement, _ attribute: String) -> Bool {
+    guard let button = axValue(element, attribute), CFGetTypeID(button) == AXUIElementGetTypeID() else { return false }
+    return axBool(button as! AXUIElement, kAXEnabledAttribute)
+}
+// Standard windows answer in one call; only dialogs are looked at more closely.
+func axIsWindow(_ element: AXUIElement) -> Bool {
+    let subrole = axValue(element, kAXSubroleAttribute) as? String
+    if subrole == kAXStandardWindowSubrole { return true }
+    guard subrole == kAXDialogSubrole || subrole == kAXSystemDialogSubrole else { return false }
+    var resizable: DarwinBoolean = false
+    AXUIElementIsAttributeSettable(element, kAXSizeAttribute as CFString, &resizable)
+    return Classifier.isWindow(subrole: subrole, modal: axBool(element, kAXModalAttribute), minimizable: axButtonEnabled(element, kAXMinimizeButtonAttribute),
+                               zoomable: axButtonEnabled(element, kAXZoomButtonAttribute), resizable: resizable.boolValue)
+}
 func axFrame(_ element: AXUIElement) -> CGRect? {
     guard let position = axValue(element, kAXPositionAttribute), CFGetTypeID(position) == AXValueGetTypeID(),
           let size = axValue(element, kAXSizeAttribute), CFGetTypeID(size) == AXValueGetTypeID() else { return nil }
@@ -98,10 +167,31 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     private var editingDraft = false
     var grid: Settings { editingDraft ? settings : (gridDraft ?? settings) }
     var gridLanes: [Lane] { grid.enabledLanes }
+    // Floating categories sit over the grid; the rest tile it.
+    func isFloating(_ lane: Lane) -> Bool { grid.isFloating(lane) }
+    var baseGridLanes: [Lane] { grid.enabledLanes.filter { !grid.isFloating($0) } }
+    // Grid categories first, floating ones last: drawn and raised on top.
+    var stackedGridLanes: [Lane] { baseGridLanes + grid.enabledLanes.filter { grid.isFloating($0) } }
+    var floatingKeys: Set<String> { Set(grid.floatingLanes) }
+    func baseRects() -> [String: ZoneRect] { layoutRects().filter { !floatingKeys.contains($0.key) } }
+    func floatingRects() -> [String: ZoneRect] { layoutRects().filter { floatingKeys.contains($0.key) } }
     private(set) var snapshot: [String: SavedWindow] = [:]
     private var overrides: [String: Lane] = [:]
     @Published var activeIDs: [Lane: String] = [:]
     private var managedIDs: Set<String> = []
+    // Layout guard: your hardware input, Lanes' own recent moves, windows waiting
+    // to be put back, and windows you moved yourself since the last check.
+    var input = UserInputClock()
+    private var lanesMovedAt: [CFHashCode: Double] = [:]
+    private var lanesMovedFrames: [CFHashCode: CGRect] = [:]
+    private var guardPending: [String: DispatchWorkItem] = [:]
+    private var guardPausedUntil = 0.0
+    private var focusConfirm: DispatchWorkItem?
+    var focusAccess = WindowFocusAccess.native
+    private var focusGeneration = 0
+    private var pendingFocus: (id: String, since: Double)?
+    private(set) var userMoved: Set<String> = []
+    private(set) var putBackCount = 0
     // The strip being dragged keeps its panel frame until the drag ends.
     var draggingStrip: Lane?
     // From the last refresh: windows in each app's own (front-to-back) order,
@@ -117,6 +207,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         if settings.placedWindows.count > 400 { settings.placedWindows.removeFirst(settings.placedWindows.count - 400) }
     }
     private var onScreenStack: [(pid: Int32, frame: CGRect)] = []
+    private var onScreenNumbers: [UInt32: Int] = [:]
     private var timer: Timer?
     // One window-created watcher per running app, for centering new windows.
     private var windowWatchers: [pid_t: AXObserver] = [:]
@@ -143,6 +234,10 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     var onKeepBoard: (() -> Void)?
     var startedInBoard: Bool { NSApp?.isActive == true && (isBoardVisible?() ?? false) }
     var onOverlay: (([(Lane, CGRect)]) -> Void)?
+    // A strip tab being dragged. While it is set, every other category shows
+    // a drop zone, so a window can change category without opening Lanes.
+    private(set) var draggedTab: String?
+    var onTabDrag: ((String?) -> Void)?
     private let settingsURL: URL
 
     init(settingsFile: URL? = nil, startPolling: Bool = true) {
@@ -157,18 +252,23 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
             MainActor.assumeIsolated {
                 guard let self, !self.busy else { return }
+                let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                let restore = app.flatMap { self.selectionsToRestore(for: $0) } ?? [:]
                 // Read the previous app's exact focused window when Lanes takes
                 // focus, even if the user switched windows within that app.
-                if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                   app.processIdentifier != getpid() { self.lastWorkingPID = app.processIdentifier }
+                if let app, app.processIdentifier != getpid() { self.lastWorkingPID = app.processIdentifier }
                 self.rememberWorkingWindow()
+                if let app, !restore.isEmpty { self.restoreSelection(restore, after: app) }
             }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.poll() }
         }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.screens = NSScreen.screens; self?.syncDisplayLayout(); self?.refresh() }
+            Task { @MainActor in
+                self?.guardPausedUntil = ProcessInfo.processInfo.systemUptime + 5
+                self?.screens = NSScreen.screens; self?.syncDisplayLayout(); self?.refresh()
+            }
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] notification in
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
@@ -183,39 +283,80 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         refresh()
         if startPolling { syncDisplayLayout(fresh: freshInstall); rememberWorkingWindow(); updateNewWindowWatch() }
     }
-    // New windows are handled the moment macOS reports them: centered, or, when
-    // they open over a category's window, counted in that category.
+    // New windows are handled the moment macOS reports them: put in their app's
+    // category or centered, or, when they open over a category's window, counted
+    // in that category. Moves and resizes are reported too, for the layout guard.
     func updateNewWindowWatch() {
-        guard trusted, settings.newWindowPlacement != .category else { for pid in Array(windowWatchers.keys) { unwatch(pid) }; return }
+        guard trusted else { for pid in Array(windowWatchers.keys) { unwatch(pid) }; return }
         for app in regularRunningApps() where windowWatchers[app.processIdentifier] == nil { watch(app.processIdentifier) }
     }
     private func watch(_ pid: pid_t) {
         var created: AXObserver?
-        let callback: AXObserverCallback = { _, element, _, context in
+        let callback: AXObserverCallback = { _, element, notification, context in
             guard let context else { return }
             let manager = Unmanaged<WindowManager>.fromOpaque(context).takeUnretainedValue()
-            MainActor.assumeIsolated { manager.windowCreated(element) }
+            let name = notification as String
+            MainActor.assumeIsolated {
+                if name == kAXWindowCreatedNotification { manager.windowCreated(element) }
+                else if name == kAXUIElementDestroyedNotification { manager.windowClosed() }
+                else { manager.windowChanged(element) }
+            }
         }
         guard AXObserverCreate(pid, callback, &created) == .success, let observer = created else { return }
-        let app = AXUIElementCreateApplication(pid)
-        guard AXObserverAddNotification(observer, app, kAXWindowCreatedNotification as CFString, Unmanaged.passUnretained(self).toOpaque()) == .success else { return }
+        let app = AXUIElementCreateApplication(pid), context = Unmanaged.passUnretained(self).toOpaque()
+        guard AXObserverAddNotification(observer, app, kAXWindowCreatedNotification as CFString, context) == .success else { return }
+        _ = AXObserverAddNotification(observer, app, kAXWindowMovedNotification as CFString, context)
+        _ = AXObserverAddNotification(observer, app, kAXWindowResizedNotification as CFString, context)
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
         windowWatchers[pid] = observer
     }
     private func unwatch(_ pid: pid_t) {
+        closeWatched = closeWatched.filter { !$0.hasPrefix("\(pid)-") }
         guard let observer = windowWatchers.removeValue(forKey: pid) else { return }
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        if trusted && (windows + outsideGrid).contains(where: { $0.pid == pid }) { windowClosed() }
+    }
+    // macOS reports a closed window only to an observer of that window, so each
+    // window Lanes knows is watched once. A close updates its strip at once
+    // instead of at the next 10-second check.
+    private var closeWatched: Set<String> = []
+    private func watchClosing(_ known: [ManagedWindow]) {
+        let open = Set(known.map(\.id))
+        closeWatched = closeWatched.intersection(open)
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        for window in known where !closeWatched.contains(window.id) {
+            guard let observer = windowWatchers[window.pid] else { continue }
+            let result = AXObserverAddNotification(observer, window.element, kAXUIElementDestroyedNotification as CFString, context)
+            if result == .success || result == .notificationAlreadyRegistered { closeWatched.insert(window.id) }
+        }
+    }
+    private var closeRefresh: DispatchWorkItem?
+    func windowClosed() {
+        closeRefresh?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, !self.busy, !self.editingDraft else { return }
+                self.refresh(silent: true); self.syncStrips()
+            }
+        }
+        closeRefresh = work
+        // A few windows closing together (a whole app's) update once.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
     }
     // A freshly launched app may open its first window before it can be watched.
     private func appLaunched(_ app: NSRunningApplication) {
-        guard trusted, settings.newWindowPlacement != .category, app.activationPolicy == .regular, app.processIdentifier != getpid() else { return }
+        guard trusted, app.activationPolicy == .regular, app.processIdentifier != getpid() else { return }
         watch(app.processIdentifier)
+        guard settings.newWindowPlacement != .category else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self, let elements = axValue(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) as? [AXUIElement] else { return }
             for element in elements { self.handleNewWindow(element) }
         }
     }
     func windowCreated(_ element: AXUIElement) {
+        // A new dialog/window is a newer foreground intention, not something
+        // a delayed confirmation of the previous selection should cover.
+        cancelFocus()
         // Let the app finish positioning its window first.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.handleNewWindow(element) }
     }
@@ -223,8 +364,8 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     private func handleNewWindow(_ element: AXUIElement) {
         guard trusted, settings.newWindowPlacement != .category, NSEvent.pressedMouseButtons == 0 else { return }
         var pid: pid_t = 0
-        guard AXUIElementGetPid(element, &pid) == .success, pid != getpid(),
-              (axValue(element, kAXSubroleAttribute) as? String) == kAXStandardWindowSubrole,
+        guard AXUIElementGetPid(element, &pid) == .success, pid != getpid(), axIsWindow(element),
+              !settings.ignoredApps.contains(NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? "pid.\(pid)"),
               !axBool(element, "AXFullScreen"), !axBool(element, kAXMinimizedAttribute),
               let frame = axFrame(element), frame.width > 80, frame.height > 60,
               centeredWindows.insert("\(pid)-\(CFHash(element))").inserted else { return }
@@ -238,25 +379,50 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         }
         // Arc, Ghostty and others open a new window exactly over the current one:
         // it stays there and joins that window's category. Otherwise Center
-        // mode moves it to the middle, where it belongs to no category.
+        // mode puts it in its app's category (WhatsApp in Messaging), or in the
+        // middle when the app has none in the grid.
         if sameSpot.count < 2 && settings.newWindowPlacement == .center {
+            if placeInCategory(element, pid: pid) { return }
             let target = NewWindowCenter.frame(for: frame.size, in: screenFrame, gap: settings.gap)
             if !TabSwitch.sameSpot(target, frame) { move(element, to: target) }
+            // Its tab appears now rather than at the next poll.
+            refresh(silent: true); syncStrips()
             return
         }
         refresh(silent: true)
-        followLayout()
+        followLayout(including: Set((windows + outsideGrid).filter { CFEqual($0.element, element) }.map(\.id)))
+    }
+    // The new window takes its category's selected pane; the window showing
+    // there stays behind it as a tab. Nothing is activated or raised.
+    private func placeInCategory(_ element: AXUIElement, pid: pid_t) -> Bool {
+        guard canUndo, !busy, !editingDraft, let app = NSRunningApplication(processIdentifier: pid) else { return false }
+        let title = (axValue(element, kAXTitleAttribute) as? String) ?? ""
+        guard let lane = Classifier.knownLane(bundleID: app.bundleIdentifier ?? "pid.\(pid)", appName: app.localizedName ?? "App", title: title, rules: settings.appRules),
+              enabledLanes.contains(lane) else { return false }
+        refresh(silent: true)
+        guard let window = windows.first(where: { CFEqual($0.element, element) }), window.lane == lane else { return false }
+        visibleSlotIDs[lane] = WindowSlots.replacing(slotIDs(lane), with: window.id, at: activeSlot[lane] ?? 0)
+        activeIDs[lane] = window.id
+        _ = apply(lane, presentationOnly: true, onlyIDs: [window.id])
+        syncStrips(); onLaneControls?()
+        status = "\(windowLabel(window)) opened in \(name(lane))."
+        return true
     }
     // Categories follow where windows are: a window that fills a category's
     // tile counts in that category, whichever app it belongs to, so its strip
     // appears and switching includes it. Floating windows are left alone.
-    @discardableResult func followLayout() -> Int {
+    @discardableResult func followLayout(including opened: Set<String> = []) -> Int {
         guard trusted, !busy, draggingStrip == nil else { return 0 }
         let tiles = enabledLanes.flatMap { lane in
             Layout.tiles(in: laneFrame(lane), count: settings.capacity(lane), gap: settings.gap, lane: lane).enumerated().map { (lane: lane, tile: $0.element, index: $0.offset) }
         }
         var joined: [(id: String, lane: Lane, index: Int)] = []
-        for window in windows + outsideGrid where !window.minimized && !userPlaced.contains(window.id) {
+        // Windows an app or agent moves keep their category. Only your own moves,
+        // and a window that just opened over its app's other window (a new tab,
+        // or a new Arc window in Browser 2), count where they sit.
+        let eligible = userMoved.union(opened)
+        userMoved.removeAll()
+        for window in windows + outsideGrid where !window.minimized && !userPlaced.contains(window.id) && eligible.contains(window.id) {
             guard let lane = TileMembership.category(of: window.frame, tiles: tiles.map { (lane: $0.lane, tile: $0.tile) }), lane != window.lane else { continue }
             let center = CGPoint(x: window.frame.midX, y: window.frame.midY)
             let index = tiles.first { $0.lane == lane && $0.tile.contains(center) }?.index ?? 0
@@ -284,6 +450,13 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         let rect = screen.visibleFrame
         return CGRect(x: rect.minX, y: mainHeight - rect.maxY, width: rect.width, height: rect.height)
     }
+    func onTargetDisplay(_ frame: CGRect) -> Bool {
+        guard let screen else { return true }
+        let mainHeight = NSScreen.screens.first?.frame.height ?? screen.frame.height
+        let displays = screens.map { CGRect(x: $0.frame.minX, y: mainHeight - $0.frame.maxY, width: $0.frame.width, height: $0.frame.height) }
+        guard let owner = WindowDisplay.owner(of: frame, displays: displays) else { return true }
+        return Self.displayID(screens[owner]) == Self.displayID(screen)
+    }
     var enabledLanes: [Lane] { settings.enabledLanes }
     var displayLabel: String {
         guard let screen else { return "No display" }
@@ -306,15 +479,19 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         if trusted && (settings.autoArrange || tick % 5 == 0) && !busy {
             let previous = windows
             refresh(silent: true)
+            adoptTabSwitches(previous: previous)
             followLayout()
-            let signature = windows.map { "\($0.id):\($0.lane.rawValue)" }.sorted().joined(separator: ",")
-            // Strips appear and disappear as categories gain or lose a second window.
-            if signature != stripSignature { stripSignature = signature; onLaneControls?() }
-            if settings.autoArrange && signature != lastSignature {
-                lastSignature = signature
+            syncStrips()
+            if settings.autoArrange && stripSignature != lastSignature {
+                lastSignature = stripSignature
                 placeNewWindows(previous: previous)
             }
         }
+    }
+    // Strips appear and disappear as categories gain or lose a second window.
+    private func syncStrips() {
+        let signature = windows.map { "\($0.id):\($0.lane.rawValue)" }.sorted().joined(separator: ",")
+        if signature != stripSignature { stripSignature = signature; onLaneControls?() }
     }
     func placeNewWindows(previous: [ManagedWindow] = []) {
         guard settings.autoArrange, canUndo, trusted, !busy else { return }
@@ -351,11 +528,13 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     // A tab switch hides one window and shows another in the same spot. The new
     // tab takes over the old one's category, slot and selection without moving,
     // so a different window is never pulled into that tile.
-    private func adoptTabSwitches(previous: [ManagedWindow]) {
+    func adoptTabSwitches(previous: [ManagedWindow]) {
         let current = Set(windows.map(\.id))
-        let vanished = previous.filter { !current.contains($0.id) && managedIDs.contains($0.id) }
+        let tabApps: Set<String> = ["com.mitchellh.ghostty", "com.apple.Terminal", "com.apple.finder"]
+        let vanished = previous.filter { !current.contains($0.id) && managedIDs.contains($0.id) && tabApps.contains($0.bundleID) }
         guard !vanished.isEmpty else { return }
-        let appeared = windows.filter { !managedIDs.contains($0.id) && !$0.minimized }
+        let previousIDs = Set(previous.map(\.id))
+        let appeared = windows.filter { !previousIDs.contains($0.id) && !$0.minimized && overrides[$0.id] == nil && !userPlaced.contains($0.id) }
         let swaps = TabSwitch.pairs(vanished: vanished.map { SeenWindow(id: $0.id, pid: $0.pid, frame: $0.frame) }, appeared: appeared.map { SeenWindow(id: $0.id, pid: $0.pid, frame: $0.frame) })
         var recategorized = false
         for (tab, old) in swaps {
@@ -367,7 +546,14 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
             }
             visibleSlotIDs[lane] = (visibleSlotIDs[lane] ?? []).map { $0 == old ? tab : $0 }
             if activeIDs[lane] == old { activeIDs[lane] = tab }
+            let original = snapshot[old], firstCapture = snapshot[tab] == nil
             capture(windows[index]); managedIDs.insert(tab)
+            // Native tabs share their window group's geometry. Restoring the
+            // newly active tab to an already tiled frame would undo Restore.
+            if firstCapture, let original {
+                snapshot[tab] = SavedWindow(element: windows[index].element, frame: original.frame, minimized: original.minimized)
+            }
+            if userPlaced.contains(old) { markPlaced(tab); recategorized = true }
         }
         if recategorized { save() }
     }
@@ -378,7 +564,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         guard trusted, !canUndo, !busy, settings.showLaneControls || settings.autoArrange, !settings.customRects.isEmpty else { return }
         refresh(silent: true)
         followLayout()
-        let order = StackOrder.positions(windows: discoveryOrder, onScreen: onScreenStack)
+        let order = StackOrder.positions(windows: discoveryOrder, onScreen: onScreenStack, numbers: onScreenNumbers)
         var adopted = 0
         for lane in enabledLanes {
             let all = items(lane), capacity = settings.capacity(lane)
@@ -415,6 +601,8 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         let oldOrder = Dictionary(uniqueKeysWithValues: windows.enumerated().map { ($1.id, $0) })
         let onScreen = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
         var visibleRects: [pid_t: [CGRect]] = [:]
+        var visibleNumbers: [pid_t: Set<UInt32>] = [:]
+        onScreenNumbers = [:]
         var stack: [(pid: Int32, frame: CGRect)] = []
         var outside: [ManagedWindow] = []
         for item in onScreen where (item[kCGWindowLayer as String] as? Int) == 0 {
@@ -422,6 +610,10 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
                   let bounds = item[kCGWindowBounds as String] as? [String: CGFloat],
                   let x = bounds["X"], let y = bounds["Y"], let w = bounds["Width"], let h = bounds["Height"] else { continue }
             visibleRects[pid_t(pid), default: []].append(CGRect(x: x, y: y, width: w, height: h))
+            if let number = item[kCGWindowNumber as String] as? UInt32 {
+                visibleNumbers[pid_t(pid), default: []].insert(number)
+                onScreenNumbers[number] = stack.count
+            }
             stack.append((pid: Int32(pid), frame: CGRect(x: x, y: y, width: w, height: h)))
         }
         onScreenStack = stack
@@ -435,18 +627,16 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
             for element in elements {
                 AXUIElementSetMessagingTimeout(element, 0.2)
                 let rawTitle = (axValue(element, kAXTitleAttribute) as? String) ?? ""
-                let subrole = axValue(element, kAXSubroleAttribute) as? String
-                guard subrole == kAXStandardWindowSubrole || Classifier.isCompactPlayer(title: rawTitle) else { continue }
+                guard axIsWindow(element) || Classifier.isCompactPlayer(title: rawTitle) else { continue }
                 guard !axBool(element, "AXFullScreen"), let frame = axFrame(element), frame.width > 80, frame.height > 60 else { continue }
                 let id = "\(app.processIdentifier)-\(CFHash(element))"
                 guard seenWindowIDs.insert(id).inserted else { continue }
                 let minimized = axBool(element, kAXMinimizedAttribute)
                 let known = managedIDs.contains(id)
-                if !known {
-                    guard minimized || app.isHidden || visibleRects[app.processIdentifier, default: []].contains(where: { abs($0.minX-frame.minX) < 8 && abs($0.minY-frame.minY) < 8 }) else { continue }
-                }
-                if settings.onlyTargetScreen && !known && !screenFrame.contains(CGPoint(x: frame.midX, y: frame.midY)) { continue }
+                guard minimized || app.isHidden || WindowVisibility.matches(number: FrontProcess.windowID(element), onScreen: visibleNumbers[app.processIdentifier, default: []], frame: frame, fallbackFrames: visibleRects[app.processIdentifier, default: []]) else { continue }
+                if settings.onlyTargetScreen && !known && !onTargetDisplay(frame) { continue }
                 let bundle = app.bundleIdentifier ?? "pid.\(app.processIdentifier)"
+                if settings.ignoredApps.contains(bundle) { continue }
                 let appName = app.localizedName ?? "App"
                 let title = (axValue(element, kAXTitleAttribute) as? String).flatMap { $0.isEmpty ? nil : $0 } ?? appName
                 let lane = overrides[id] ?? Classifier.lane(bundleID: bundle, appName: appName, title: title, rules: settings.appRules)
@@ -459,7 +649,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
                 result.append(ManagedWindow(id: id, element: element, pid: app.processIdentifier, bundleID: bundle, appName: appName, title: title, icon: app.icon, frame: frame, minimized: minimized, lane: lane))
             }
         }
-        discoveryOrder = result.map { SeenWindow(id: $0.id, pid: $0.pid, frame: $0.frame) }
+        discoveryOrder = result.map { SeenWindow(id: $0.id, pid: $0.pid, frame: $0.frame, number: FrontProcess.windowID($0.element)) }
         result.sort {
             let categoryA = availableLanes.firstIndex(of: $0.lane) ?? Int.max, categoryB = availableLanes.firstIndex(of: $1.lane) ?? Int.max
             if categoryA != categoryB { return categoryA < categoryB }
@@ -474,6 +664,12 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         }
         windows = result
         outsideGrid = outside
+        let live = Set((result + outside).map { CFHash($0.element) })
+        lanesMovedAt = lanesMovedAt.filter { live.contains($0.key) }
+        lanesMovedFrames = lanesMovedFrames.filter { live.contains($0.key) }
+        let open = Set((result + outside).map(\.id))
+        windowNumbers = windowNumbers.filter { open.contains($0.key) }
+        watchClosing(result + outside)
         for lane in enabledLanes { pages[lane] = min(pages[lane] ?? 0, pageCount(lane) - 1) }
         if !silent { status = "\(windows.count) windows found. Assign them, then arrange your desktop." }
     }
@@ -536,6 +732,33 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         onLaneControls?()
         status = "\(app.name) now goes to \(name(lane))."; selectedTemplateChanged = true
     }
+    // Leave an app alone: its windows lose their tabs and Lanes never moves,
+    // centers or puts them back. They stay exactly where they are.
+    struct IgnoredApp: Identifiable { let id: String; let name: String; let icon: NSImage? }
+    var ignoredAppList: [IgnoredApp] {
+        settings.ignoredApps.map { bundle in
+            if let running = runningApps.first(where: { $0.bundleID == bundle }) { return IgnoredApp(id: bundle, name: running.name, icon: running.icon) }
+            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle)
+            return IgnoredApp(id: bundle, name: url.map { FileManager.default.displayName(atPath: $0.path).replacingOccurrences(of: ".app", with: "") } ?? bundle, icon: url.map { NSWorkspace.shared.icon(forFile: $0.path) })
+        }
+    }
+    func isIgnored(_ bundleID: String) -> Bool { settings.ignoredApps.contains(bundleID) }
+    func ignoreApp(_ bundleID: String, name: String) {
+        guard !settings.ignoredApps.contains(bundleID) else { return }
+        settings.ignoredApps.append(bundleID)
+        for window in windows + outsideGrid where window.bundleID == bundleID {
+            guardPending.removeValue(forKey: window.id)?.cancel(); managedIDs.remove(window.id)
+        }
+        save(); refresh(silent: true); onLaneControls?()
+        status = "Lanes leaves \(name) alone. Drag it onto a category to manage it again."
+    }
+    func manageApp(_ bundleID: String) {
+        guard settings.ignoredApps.contains(bundleID) else { return }
+        settings.ignoredApps.removeAll { $0 == bundleID }
+        save(); refresh(silent: true); onLaneControls?()
+        status = "\(ignoredName(bundleID)) is managed by Lanes again."
+    }
+    private func ignoredName(_ bundleID: String) -> String { runningApps.first { $0.bundleID == bundleID }?.name ?? "The app" }
     func activateApp(_ app: RunningAppSummary) { NSRunningApplication(processIdentifier: app.pid)?.activate() }
     func items(_ lane: Lane) -> [ManagedWindow] { windows.filter { $0.lane == lane } }
     func pageCount(_ lane: Lane) -> Int { Layout.pageCount(total: items(lane).count, capacity: settings.capacity(lane)) }
@@ -586,15 +809,25 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     // The panel's size right now. Layout and reserved space always use the
     // idle size, so hovering never moves a window.
     func displayedStripMetrics(_ lane: Lane) -> WindowStripMetrics {
-        guard settings.stripStyle(lane) == .expanding, expandedStrip == lane else { return stripMetrics(lane) }
-        return WindowStripMetrics.measure(style: .detailed, count: items(lane).count, scale: settings.windowStripScale, availableWidth: rawLaneFrame(lane).width, slots: settings.capacity(lane))
+        guard settings.stripStyle(lane).expandsOnHover, expandedStrip == lane else { return stripMetrics(lane) }
+        let count = items(lane).count, width = rawLaneFrame(lane).width, slots = settings.capacity(lane)
+        if stripUsesList(lane) { return WindowStripMetrics.list(count: count, scale: settings.windowStripScale, availableWidth: width, slots: slots) }
+        return WindowStripMetrics.measure(style: .detailed, count: count, scale: settings.windowStripScale, availableWidth: width, slots: slots)
+    }
+    func stripUsesList(_ lane: Lane) -> Bool {
+        guard settings.stripStyle(lane).expandsOnHover, items(lane).count > 1 else { return false }
+        switch settings.stripList {
+        case .always: return true
+        case .never: return false
+        case .narrow: return WindowStripMetrics.usesList(count: items(lane).count, scale: settings.windowStripScale, availableWidth: rawLaneFrame(lane).width, slots: settings.capacity(lane))
+        }
     }
     // Grows at once; shrinks a moment after the mouse leaves, so crossing the
     // edge of the growing strip cannot make it flicker.
     func stripHovered(_ lane: Lane, _ hovering: Bool) {
         collapseStrip?.cancel(); collapseStrip = nil
         if hovering {
-            guard settings.stripStyle(lane) == .expanding, expandedStrip != lane else { return }
+            guard settings.stripStyle(lane).expandsOnHover, expandedStrip != lane else { return }
             expandedStrip = lane; onLaneControls?()
             return
         }
@@ -635,13 +868,92 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
             canUndo = true
         }
     }
+    // Your mouse and keyboard, as seen by Lanes' global event monitors.
+    func noteInput(_ event: NSEvent) {
+        guard let source = event.cgEvent?.getIntegerValueField(.eventSourceUnixProcessID) else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        switch event.type {
+        case .leftMouseDown: input.pointer(held: true, sourcePID: source, at: now)
+        case .leftMouseUp: input.pointer(held: false, sourcePID: source, at: now)
+        case .leftMouseDragged: input.pointer(held: nil, sourcePID: source, at: now)
+        case .rightMouseDown, .otherMouseDown:
+            input.press(sourcePID: source, at: now)
+            input.pointer(held: nil, sourcePID: source, at: now)
+        case .keyDown: input.key(modified: !event.modifierFlags.intersection([.command, .control, .option]).isEmpty, sourcePID: source, at: now)
+        default: break
+        }
+    }
+    // A window moved or resized. If you did it, it counts (and may join the
+    // category it now fills). Anything else, such as a computer-use agent or the
+    // app itself, is put back into its tile once the moves settle.
+    func windowChanged(_ element: AXUIElement) {
+        guard trusted else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let at = lanesMovedAt[CFHash(element)], now - at < 1.0 { return }
+        if let moved = lanesMovedFrames[CFHash(element)], let current = axFrame(element), TabSwitch.sameSpot(moved, current) { return }
+        guard let window = (windows + outsideGrid).first(where: { CFEqual($0.element, element) }) else { return }
+        let screen = NSScreen.screens.first, location = NSEvent.mouseLocation
+        let point = CGPoint(x: location.x, y: (screen?.frame.height ?? 0) - location.y)
+        let onWindow = [window.frame, axFrame(element) ?? window.frame].contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
+        let menuBar = (screen.map { $0.frame.maxY - $0.visibleFrame.maxY } ?? 30) + 4
+        let inItsMenuBar = point.y < menuBar && NSWorkspace.shared.frontmostApplication?.processIdentifier == window.pid
+        windowChanged(window.id, userActive: input.causedMove(at: now, buttonDown: NSEvent.pressedMouseButtons != 0, pointerOnWindow: onWindow, pointerInItsMenuBar: inItsMenuBar), at: now)
+    }
+    func windowChanged(_ id: String, userActive: Bool, at now: Double) {
+        if userActive { userMoved.insert(id); guardPending.removeValue(forKey: id)?.cancel(); return }
+        guard guards(id), now >= guardPausedUntil else { return }
+        schedulePutBack(id, after: 0.4)
+    }
+    func guards(_ id: String) -> Bool {
+        settings.keepLayout && canUndo && !busy && !editingDraft && draggingStrip == nil && managedIDs.contains(id) && windows.contains { $0.id == id }
+    }
+    private func schedulePutBack(_ id: String, after delay: Double) {
+        guardPending[id]?.cancel()
+        let work = DispatchWorkItem { [weak self] in MainActor.assumeIsolated { self?.putBack(id) } }
+        guardPending[id] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+    // Where Organize keeps this window: its pane, or its queue tile behind it.
+    func expectedFrame(_ window: ManagedWindow) -> CGRect? {
+        let lane = window.lane
+        let plan = Layout.stack(ids: items(lane).map(\.id), foreground: slotIDs(lane), in: laneFrame(lane), gap: settings.gap, lane: lane, slotCount: settings.capacity(lane))
+        return plan.frames[window.id]
+    }
+    func putBack(_ id: String) {
+        guardPending[id] = nil
+        let now = ProcessInfo.processInfo.systemUptime
+        guard trusted, guards(id), now >= guardPausedUntil, let window = windows.first(where: { $0.id == id }), let target = expectedFrame(window) else { return }
+        // Mid-drag, wait until you let go; your drag then decides.
+        if input.dragging(buttonDown: NSEvent.pressedMouseButtons != 0) { schedulePutBack(id, after: 0.4); return }
+        if axBool(window.element, "AXFullScreen") {
+            // Leaving full screen animates; finish once it has.
+            _ = AXUIElementSetAttributeValue(window.element, "AXFullScreen" as CFString, kCFBooleanFalse)
+            schedulePutBack(id, after: 1.0); return
+        }
+        // Fixed-size windows that already fit must not enter a resize loop.
+        guard let current = axFrame(window.element), !WindowPlacement.fits(current, in: target) else { return }
+        if move(window.element, to: target) {
+            if let index = windows.firstIndex(where: { $0.id == id }) { windows[index].frame = target }
+            putBackCount += 1
+            status = "Put \(windowLabel(window)) back in \(name(window.lane)). Only your own mouse and keyboard rearrange windows."
+        }
+    }
     @discardableResult func movePreservingOriginal(_ window: ManagedWindow, to frame: CGRect) -> Bool {
         capture(window)
         return move(window.element, to: frame)
     }
     @discardableResult func move(_ element: AXUIElement, to frame: CGRect) -> Bool {
+        lanesMovedAt[CFHash(element)] = ProcessInfo.processInfo.systemUptime
         var position = frame.origin, size = frame.size
         guard let p = AXValueCreate(.cgPoint, &position), let s = AXValueCreate(.cgSize, &size) else { return false }
+        // An app with enhanced accessibility on (other automation tools switch it
+        // on) animates every move, and macOS drops the resize mid-slide. Switch it
+        // off for the move and back on after, like other window managers do.
+        var pid: pid_t = 0
+        let app = AXUIElementGetPid(element, &pid) == .success ? AXUIElementCreateApplication(pid) : nil
+        let enhanced = app.map { axBool($0, "AXEnhancedUserInterface") } ?? false
+        if enhanced, let app { AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanFalse) }
+        defer { if enhanced, let app { AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue) } }
         // Two passes accommodate windows that clamp their origin when resizing.
         _ = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, s)
         let positionResult = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, p)
@@ -649,8 +961,8 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         _ = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, p)
         guard positionResult == .success, let actual = axFrame(element) else { return false }
         // A fixed-size window is allowed if it fits inside the requested tile.
-        let fits = actual.width <= frame.width + 12 && actual.height <= frame.height + 12 && abs(actual.minX-frame.minX) < 12 && abs(actual.minY-frame.minY) < 12
-        return fits
+        lanesMovedFrames[CFHash(element)] = actual
+        return WindowPlacement.fits(actual, in: frame)
     }
     func autoOrganize(hideBoard: Bool = true, forceAutoLayout: Bool = false) {
         guard !busy, !editingDraft else { return }
@@ -682,7 +994,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         }
         observedMinimumSizes = [:]
         let plan = AutoSorter.plan(items: populated.map { AutoSortItem(lane: $0, count: items($0).count, isFocused: $0 == workingWindow?.lane, stripInset: settings.stripReservesSpace ? stripMetrics($0).reservedHeight : 0) }, screen: screenFrame, gap: settings.gap)
-        rememberLayout(); settings.customRects = plan.rects; settings.useCustomGrid = false
+        rememberLayout(); settings.customRects = plan.rects; settings.floatingLanes = []; settings.useCustomGrid = false
         for (lane, capacity) in plan.capacities { settings.capacities[lane] = capacity; if let category = Lane(rawValue: lane) { pages[category] = 0 } }
         save(); refreshRunningApps(); arrange(hideBoard: hideBoard)
         // If an app clamps its size, give the measured minimum more weight and
@@ -704,17 +1016,30 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         let rects: [String: ZoneRect]
         let savedID: String?
         let shape: PresetShape?
+        var floating: [String] = []
     }
     @Published var presetPreview: PresetPreview?
     func previewPreset(_ shape: PresetShape) {
         let lanes = gridLanes
         let counts = Dictionary(uniqueKeysWithValues: lanes.map { ($0, items($0).count) })
-        let main = lanes.contains(selectedLane) ? selectedLane : lanes.first ?? .terminal
-        presetPreview = PresetPreview(name: shape.title, lanes: lanes, rects: shape.rects(lanes: lanes, main: main, windows: counts), savedID: nil, shape: shape)
+        let main = lanes.contains(selectedLane) ? selectedLane : baseGridLanes.first ?? lanes.first ?? .terminal
+        if shape == .overlay {
+            // Browser fills the screen when it is in the grid; the rest float over it.
+            let main = lanes.contains(.browser) ? Lane.browser : main
+            presetPreview = PresetPreview(name: shape.title, lanes: lanes, rects: shape.rects(lanes: lanes, main: main, windows: counts), savedID: nil, shape: shape, floating: shape.floating(lanes: lanes, main: main))
+            return
+        }
+        // Other presets arrange the grid and leave floating categories where they are.
+        let base = baseGridLanes.isEmpty ? lanes : baseGridLanes
+        let kept = base.count == lanes.count ? [:] : floatingRects()
+        let rects = shape.rects(lanes: base, main: base.contains(main) ? main : base[0], windows: counts).merging(kept) { grid, _ in grid }
+        presetPreview = PresetPreview(name: shape.title, lanes: lanes, rects: rects, savedID: nil, shape: shape, floating: kept.isEmpty ? [] : grid.floatingLanes)
     }
     func previewSavedLayout(_ layout: SavedGridLayout) {
-        presetPreview = PresetPreview(name: layout.name, lanes: layout.lanes.compactMap(Lane.init(rawValue:)), rects: layout.rects, savedID: layout.id, shape: nil)
+        presetPreview = PresetPreview(name: layout.name, lanes: layout.lanes.compactMap(Lane.init(rawValue:)), rects: layout.rects, savedID: layout.id, shape: nil, floating: layout.floating ?? [])
     }
+    // The presets that suit the display the grid is for.
+    var presetShapes: [PresetShape] { PresetShape.shapes(for: DisplayKind.of(screenFrame.size)) }
     func applyPresetPreview() {
         guard presetPreview != nil, commitPendingGrid() else { return }
         if trusted { arrange(hideBoard: false) } else { onLaneControls?() }
@@ -724,7 +1049,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     @discardableResult func commitPendingGrid() -> Bool {
         let preview = presetPreview
         if let preview {
-            guard GridGeometry.valid(preview.rects, lanes: preview.lanes) else {
+            guard GridGeometry.valid(preview.rects, lanes: preview.lanes, floating: Set(preview.floating)) else {
                 status = "This preset does not fit your categories."; return false
             }
             if let id = preview.savedID, !settings.savedLayouts.contains(where: { $0.id == id }) {
@@ -739,7 +1064,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         } else {
             settings.previousLayout = currentGridLayout(name: "Previous layout")
             let before = layoutRects()
-            rememberLayout(); settings.customRects = preview.rects
+            rememberLayout(); settings.customRects = preview.rects; settings.floatingLanes = preview.floating
             recenterMovedStrips(changedFrom: before)
             layoutChanged("\(preview.name) applied.")
         }
@@ -777,16 +1102,19 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         try? data.write(to: settingsURL.deletingLastPathComponent().appendingPathComponent("window-access-state.json"), options: .atomic)
     }
     func arrange(hideBoard: Bool = true) {
-        guard !editingDraft else { return }
+        guard !editingDraft, !busy else { return }
         guard trusted else { status = "Enable window control to arrange your apps."; return }
         guard commitPendingGrid() else { return }
         let stay = startedInBoard
+        let working = rememberWorkingWindow()
+        cancelFocus()
         busy = true
         refresh(silent: true)
         if windows.isEmpty { status = "No movable windows on this desktop. Open some apps, then refresh."; busy = false; return }
         var constrained = 0, failed = 0
-        for lane in enabledLanes {
-            let outcome = apply(lane)
+        let order = enabledLanes.filter { !settings.isFloating($0) } + enabledLanes.filter { settings.isFloating($0) }
+        for lane in order {
+            let outcome = apply(lane, raiseWindows: false)
             constrained += outcome.constrained; failed += outcome.failed
         }
         let cleared = centerStrays()
@@ -796,15 +1124,15 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         if cleared > 0 { status += " \(cleared) windows without a category moved to the middle." }
         if constrained > 0 { status += " \(constrained) tiles exceed app minimum sizes; use fewer tiles or widen a lane." }
         if failed > 0 { status += " \(failed) windows could not be positioned." }
-        for lane in enabledLanes {
+        for lane in order {
             for window in visibleItems(lane) {
-                NSRunningApplication(processIdentifier: window.pid)?.activate()
-                _ = AXUIElementPerformAction(window.element, kAXRaiseAction as CFString)
+                _ = focusAccess.raise(window)
             }
         }
         busy = false
         onLaneControls?()
         if stay { onKeepBoard?() }
+        else if let working, let window = windows.first(where: { $0.id == working }) { focus(window, hideBoard: false) }
     }
     func apply(_ lane: Lane, presentationOnly: Bool = false, raiseWindows: Bool = true, onlyIDs: Set<String>? = nil) -> (constrained: Int, failed: Int) {
         guard !editingDraft else { return (0, 0) }
@@ -814,6 +1142,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         let ids = Set(visible.map(\.id))
         let stack = Layout.stack(ids: all.map(\.id), foreground: slots, in: laneFrame(lane), gap: settings.gap, lane: lane, presentationOnly: presentationOnly, onlyIDs: onlyIDs, slotCount: settings.capacity(lane))
         if !ids.contains(activeIDs[lane] ?? "") { activeIDs[lane] = visible.first?.id }
+        guard trusted else { return (0, stack.raiseOrder.count) }
         var constrained = 0, failed = 0
         // Keep every discovered window open. Queue members share a tile behind
         // its selected window instead of disappearing into the Dock.
@@ -856,6 +1185,12 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     }
     @discardableResult func rememberWorkingWindow() -> String? {
         guard trusted, !busy else { return nil }
+        // App activation can transiently report the wrong main window. Do not
+        // turn that intermediate state into a selection in another category.
+        if let pending = pendingFocus {
+            if !input.pressed(since: pending.since), windows.contains(where: { $0.id == pending.id }) { return pending.id }
+            cancelFocus()
+        }
         if let frontmost = NSWorkspace.shared.frontmostApplication, frontmost.processIdentifier != getpid(), frontmost.activationPolicy == .regular {
             lastWorkingPID = frontmost.processIdentifier
         }
@@ -864,9 +1199,56 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         AXUIElementSetMessagingTimeout(app, 0.2)
         guard let focused = axValue(app, kAXFocusedWindowAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID(),
               let window = windows.first(where: { $0.pid == pid && CFEqual($0.element, focused) }) else { return nil }
-        activeIDs[window.lane] = window.id
-        if hoveredLane != window.lane, let slot = slotIDs(window.lane).firstIndex(of: window.id) { activeSlot[window.lane] = slot }
+        recordWorkingSelection(window)
         return window.id
+    }
+    // The tab each category showed for this app before it came forward, unless
+    // you clicked one of its windows or Lanes itself brought it forward.
+    // Read before the app's own front window is recorded as the selection.
+    private func selectionsToRestore(for app: NSRunningApplication) -> [Lane: (selected: String, showing: [String])] {
+        guard trusted, pendingFocus == nil, app.processIdentifier != getpid(), let bundle = app.bundleIdentifier else { return [:] }
+        let now = ProcessInfo.processInfo.systemUptime
+        let location = NSEvent.mouseLocation, mainHeight = NSScreen.screens.first?.frame.height ?? 0
+        let pointer = CGPoint(x: location.x, y: mainHeight - location.y)
+        let onItsWindow = (windows + outsideGrid).contains { $0.bundleID == bundle && $0.frame.contains(pointer) }
+        if input.mouseDown(within: 0.6, at: now) && onItsWindow { return [:] }
+        var selected: [Lane: (selected: String, showing: [String])] = [:]
+        for lane in enabledLanes {
+            if let window = activeWindow(lane), window.bundleID == bundle { selected[lane] = (window.id, slotIDs(lane).filter { $0 != window.id }) }
+        }
+        return selected
+    }
+    private func restoreSelection(_ selected: [Lane: (selected: String, showing: [String])], after app: NSRunningApplication) {
+        // Let the app finish raising its own window first.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, !self.busy, self.pendingFocus == nil,
+                      NSWorkspace.shared.frontmostApplication?.bundleIdentifier == app.bundleIdentifier,
+                      let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
+                let element = AXUIElementCreateApplication(frontPID)
+                guard let focused = axValue(element, kAXFocusedWindowAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID(),
+                      let front = self.windows.first(where: { $0.pid == frontPID && CFEqual($0.element, focused as! AXUIElement) }),
+                      let before = selected[front.lane], let window = self.windows.first(where: { $0.id == before.selected }) else { return }
+                let clicked = self.input.mouseDown(within: 0.75, at: ProcessInfo.processInfo.systemUptime) && front.frame.contains({ let l = NSEvent.mouseLocation; return CGPoint(x: l.x, y: (NSScreen.screens.first?.frame.height ?? 0) - l.y) }())
+                guard ActivationRestore.shouldRestore(front: front.id, selected: before.selected, visible: before.showing, clickedWindow: clicked, lanesAsked: false) else { return }
+                // As a strip click would: the strip, its pane and the window agree.
+                self.reveal(window)
+                self.status = "\(self.name(window.lane)) · \(self.windowLabel(window)): the tab you were on."
+            }
+        }
+    }
+    func recordWorkingSelection(_ window: ManagedWindow) {
+        guard enabledLanes.contains(window.lane) else { return }
+        activeIDs[window.lane] = window.id
+        var slots = slotIDs(window.lane)
+        if !slots.contains(window.id) {
+            let tiles = Layout.tiles(in: laneFrame(window.lane), count: settings.capacity(window.lane), gap: settings.gap, lane: window.lane)
+            let center = CGPoint(x: window.frame.midX, y: window.frame.midY)
+            let slot = tiles.firstIndex(where: { $0.contains(center) }) ?? activeSlot[window.lane] ?? 0
+            slots = WindowSlots.replacing(slots, with: window.id, at: slot)
+            visibleSlotIDs[window.lane] = slots
+        }
+        if hoveredLane != window.lane, let slot = slots.firstIndex(of: window.id) { activeSlot[window.lane] = slot }
     }
     func cycleWindow(_ lane: Lane, delta: Int = 1) {
         guard !settings.hiddenLanes.contains(lane.rawValue) else { status = "Restore \(name(lane)) in Preferences to use its shortcut."; return }
@@ -918,32 +1300,110 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         status = moved ? "\(window.appName) \(resize ? "resized" : "moved") within \(name(window.lane))." : "This app enforces a minimum window size or prevents resizing."
         focus(window)
     }
-    func reveal(_ window: ManagedWindow) {
+    func reveal(_ requested: ManagedWindow) {
         guard !editingDraft else { return }
+        // A strip/menu may hold an older value after a category move or close.
+        guard let window = windows.first(where: { $0.id == requested.id }), enabledLanes.contains(window.lane) else {
+            status = "That window is no longer in the grid. Refresh to update the list."; return
+        }
+        let before = trusted ? showing().tops : [:]
         selectedLane = window.lane
         if hoveredLane != window.lane, let focused = focusedWindow(), focused.lane == window.lane, let slot = slotIDs(window.lane).firstIndex(of: focused.id) { activeSlot[window.lane] = slot }
         let oldSlots = slotIDs(window.lane)
         visibleSlotIDs[window.lane] = WindowSlots.replacing(oldSlots, with: window.id, at: activeSlot[window.lane] ?? 0)
-        _ = apply(window.lane, presentationOnly: true, onlyIDs: [window.id])
-        focus(window)
+        if trusted { _ = apply(window.lane, presentationOnly: true, onlyIDs: [window.id]) }
+        focus(window, preserving: before)
         onLaneControls?()
     }
-    func focus(_ window: ManagedWindow, hideBoard: Bool = true) {
-        guard !editingDraft else { return }
+    func cancelFocus() {
+        focusGeneration &+= 1
+        focusConfirm?.cancel(); focusConfirm = nil; pendingFocus = nil
+    }
+    func focus(_ requested: ManagedWindow, hideBoard: Bool = true, preserving previous: [String: UInt32]? = nil) {
+        guard !editingDraft, let window = windows.first(where: { $0.id == requested.id }), enabledLanes.contains(window.lane) else { return }
+        cancelFocus()
         activeIDs[window.lane] = window.id
         if let slot = slotIDs(window.lane).firstIndex(of: window.id) { activeSlot[window.lane] = slot }
         selectedLane = window.lane
-        if window.minimized { _ = AXUIElementSetAttributeValue(window.element, kAXMinimizedAttribute as CFString, kCFBooleanFalse) }
-        // Raise the exact window before activating another app. Within the same
-        // app, avoid activation entirely so its other windows stay in place.
-        _ = AXUIElementPerformAction(window.element, kAXRaiseAction as CFString)
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier != window.pid {
-            if NSRunningApplication(processIdentifier: window.pid)?.activate() != true { _ = FrontProcess.bring(pid: window.pid, window: window.element) }
-            _ = AXUIElementPerformAction(window.element, kAXRaiseAction as CFString)
+        guard trusted else { return }
+        let before = previous ?? showing().tops
+        let start = ProcessInfo.processInfo.systemUptime
+        let generation = focusGeneration
+        pendingFocus = (window.id, start)
+        if window.minimized { focusAccess.unminimize(window) }
+        focusAccess.prepare(window)
+        _ = focusAccess.raise(window)
+        if focusAccess.frontPID() != window.pid {
+            _ = focusAccess.activate(window)
+            _ = focusAccess.raise(window)
+        }
+        // Repair synchronous activation effects immediately, then check the
+        // app's delayed main-window changes. Only covered panes are touched.
+        reconcileFocus(window, showing: before)
+        confirmFront(window, since: start, showing: before, generation: generation)
+    }
+    // A window keeps its window server number while it is open. Focus checks run
+    // every 30 ms, so each window is asked for it once rather than every check.
+    private var windowNumbers: [String: UInt32] = [:]
+    private func number(_ window: ManagedWindow) -> UInt32? {
+        if let known = windowNumbers[window.id] { return known }
+        let found = focusAccess.windowID(window)
+        if let found { windowNumbers[window.id] = found }
+        return found
+    }
+    // The exact window server identity, rather than a PID/frame guess, tells
+    // apart Arc windows and native tabs occupying identical rectangles.
+    private func showing() -> (tops: [String: UInt32], known: [UInt32: ManagedWindow]) {
+        var known: [UInt32: ManagedWindow] = [:]
+        for window in windows + outsideGrid { if let id = number(window) { known[id] = window } }
+        let stack = focusAccess.stack()
+        var tops: [String: UInt32] = [:]
+        for lane in enabledLanes {
+            for (index, tile) in Layout.tiles(in: laneFrame(lane), count: settings.capacity(lane), gap: settings.gap, lane: lane).enumerated() {
+                // An unknown window on top is not skipped to find a managed one
+                // behind it: alerts and newly opened apps must not be covered.
+                let top = stack.first { window in
+                    let shared = window.frame.intersection(tile)
+                    return !shared.isNull && shared.width * shared.height >= tile.width * tile.height * 0.6
+                }
+                if let top, known[top.number] != nil { tops["\(lane.rawValue)#\(index)"] = top.number }
+            }
+        }
+        return (tops, known)
+    }
+    private func reconcileFocus(_ window: ManagedWindow, showing before: [String: UInt32]) {
+        guard focusAccess.frontPID() == window.pid, let wanted = number(window) else { return }
+        let now = showing()
+        let top = focusAccess.stack().first { $0.pid == window.pid }?.number
+        if let top, now.known[top] == nil { return } // New windows and modal alerts win.
+        let slot = slotIDs(window.lane).firstIndex(of: window.id) ?? activeSlot[window.lane] ?? 0
+        let changing = "\(window.lane.rawValue)#\(slot)"
+        let covered = FocusConfirm.covered(before: before, after: now.tops, wanted: wanted,
+                                          sameApp: Set(now.known.filter { $0.value.pid == window.pid }.keys), excluding: [changing])
+        for id in covered {
+            if let back = now.known[id], !back.minimized { _ = focusAccess.raise(back) }
+        }
+        let repairedTop = focusAccess.stack().first { $0.pid == window.pid }?.number
+        if !covered.isEmpty || FocusConfirm.shouldRaise(appInFront: true, topWindow: repairedTop, wanted: wanted, pressedSince: false) {
+            _ = focusAccess.raise(window)
         }
     }
+    private func confirmFront(_ window: ManagedWindow, since start: Double, showing before: [String: UInt32], generation: Int, check: Int = 0) {
+        guard FocusConfirm.checks.indices.contains(check), number(window) != nil else { pendingFocus = nil; return }
+        let work = DispatchWorkItem { [weak self] in MainActor.assumeIsolated {
+            guard let self, self.focusGeneration == generation else { return }
+            guard self.trusted, !self.editingDraft, !self.input.pressed(since: start),
+                  let current = self.windows.first(where: { $0.id == window.id }), current.lane == window.lane,
+                  self.enabledLanes.contains(current.lane) else { self.cancelFocus(); return }
+            self.reconcileFocus(current, showing: before)
+            self.confirmFront(current, since: start, showing: before, generation: generation, check: check + 1)
+        } }
+        focusConfirm = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + FocusConfirm.checks[check] - (check > 0 ? FocusConfirm.checks[check - 1] : 0), execute: work)
+    }
     // `arrange: false` only records the category; the window moves at the next Organize.
-    func moveWindow(_ window: ManagedWindow, to lane: Lane, arrange arrangeNow: Bool = true) {
+    func moveWindow(_ requested: ManagedWindow, to lane: Lane, arrange arrangeNow: Bool = true) {
+        guard let window = (windows + outsideGrid).first(where: { $0.id == requested.id }) else { return }
         markPlaced(window.id)
         // A window whose own category is shelved can still join any category.
         if enabledLanes.contains(lane), let outside = outsideGrid.firstIndex(where: { $0.id == window.id }) {
@@ -978,11 +1438,15 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         while availableLanes.contains(where: { name($0) == "\(base) \(suffix)" }) { suffix += 1 }
         let category = CustomCategory(name: "\(base) \(suffix)")
         var rects = layoutRects(); rects[source.rawValue] = ZoneRect(first); rects[category.id] = ZoneRect(second)
-        guard GridGeometry.valid(rects, lanes: enabledLanes + [category.lane]) else { status = "This region is too small to split again."; return nil }
+        // Halves of a floating category float too.
+        var floating = Set(settings.floatingLanes)
+        if floating.contains(source.rawValue) { floating.insert(category.id) }
+        guard GridGeometry.valid(rects, lanes: enabledLanes + [category.lane], floating: floating) else { status = "This region is too small to split again."; return nil }
         let sourceWindows = items(source)
         let moved = visibleItems(source).dropFirst().first ?? sourceWindows.first(where: { $0.id != activeWindow(source)?.id })
         rememberLayout()
         settings.customCategories.append(category); settings.customRects = rects
+        if settings.isFloating(source) { settings.floatingLanes.append(category.id) }
         settings.capacities[source.rawValue] = 1; settings.capacities[category.id] = 1
         settings.useCustomGrid = true
         if let moved, let index = windows.firstIndex(where: { $0.id == moved.id }) {
@@ -997,21 +1461,24 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         return category.lane
     }
     func assign(_ window: ManagedWindow, to lane: Lane, rememberApp: Bool = false) {
+        guard availableLanes.contains(lane) else { return }
         if !rememberApp, enabledLanes.contains(lane) { moveWindow(window, to: lane); return }
         if lane == .media && !settings.showMediaShelf { restoreCategory(.media) }
-        overrides[window.id] = lane
         if rememberApp {
-            let appIDs = Set(windows.filter { $0.bundleID == window.bundleID }.map(\.id))
-            overrides = overrides.filter { !appIDs.contains($0.key) }
-            settings.windowCategories = settings.windowCategories.filter { !appIDs.contains($0.key) }
-            settings.appRules[window.bundleID] = lane.rawValue; save()
+            assignApp(RunningAppSummary(pid: window.pid, name: window.appName, bundleID: window.bundleID, icon: window.icon, lane: window.lane), to: lane)
+            return
         }
+        overrides[window.id] = lane; settings.windowCategories[window.id] = lane.rawValue
+        markPlaced(window.id); save()
         refresh(silent: true)
         status = "\(window.appName) assigned to \(name(lane)). Arrange to apply."
         selectedTemplateChanged = true
     }
     func undo() {
         guard trusted else { status = "Enable window control to restore positions."; return }
+        cancelFocus()
+        for work in guardPending.values { work.cancel() }
+        guardPending.removeAll(); userMoved.removeAll()
         var failures = 0
         for saved in snapshot.values {
             _ = AXUIElementSetAttributeValue(saved.element, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
@@ -1038,6 +1505,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         let changed = settings.switchDisplay(to: Self.displayKey(screen), kind: DisplayKind.of(screen.frame.size), fresh: fresh)
         save()
         guard changed else { return }
+        cancelFocus()
         presetPreview = nil; gridDraft = nil
         refresh(silent: true)
         if !enabledLanes.contains(selectedLane), let first = enabledLanes.first { selectedLane = first }
@@ -1045,16 +1513,17 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         status = firstTime ? "Lanes chose a layout made for this screen." : "Switched to your grid for \(screen.localizedName). Press Organize to arrange your windows."
     }
     func category(at point: CGPoint, in area: CGRect) -> Lane? {
-        grid.enabledLanes.first { lane in
+        stackedGridLanes.reversed().first { lane in
             let unit = grid.unitRect(for: lane)
             return Layout.frame(unit: unit, in: area, gap: 7).contains(point)
         }
     }
     func removeCategory(_ lane: Lane) {
-        guard enabledLanes.count > 1, enabledLanes.contains(lane) else { return }
+        guard enabledLanes.count > 1, enabledLanes.contains(lane), settings.isFloating(lane) || baseGridLanes.count > 1 else { return }
         // Keep the hole and the group's assignments so shelving is reversible.
         var rects = layoutRects(); rects.removeValue(forKey: lane.rawValue)
         settings.customRects = rects
+        settings.floatingLanes.removeAll { $0 == lane.rawValue }
         settings.useCustomGrid = true
         layoutHistory = []
         settings.hiddenLanes.append(lane.rawValue)
@@ -1071,10 +1540,10 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     func restoreCategory(_ lane: Lane, at point: CGPoint? = nil) {
         guard availableLanes.contains(lane), !enabledLanes.contains(lane) else { return }
         if !settings.customRects.isEmpty, !enabledLanes.contains(lane) {
-            guard let restored = GridGeometry.restoring(lane, rects: layoutRects(), active: enabledLanes, at: point) else {
+            guard let restored = GridGeometry.restoring(lane, rects: baseRects(), active: baseGridLanes, at: point) else {
                 status = "Make room by resizing another category, then restore \(name(lane))."; return
             }
-            settings.customRects = restored
+            settings.customRects = restored.merging(floatingRects()) { grid, _ in grid }
         }
         layoutHistory = []
         settings.hiddenLanes.removeAll { $0 == lane.rawValue }
@@ -1090,14 +1559,16 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         selectedLane = lane; gridSelectionActive = true; onGridSelection?()
     }
     func name(_ lane: Lane) -> String { settings.name(lane) }
-    func windowLabel(_ window: ManagedWindow) -> String {
+    func windowLabel(_ window: ManagedWindow) -> String { windowLabel(window, long: false) }
+    // `long`: room for a whole line, as in a strip's list.
+    func windowLabel(_ window: ManagedWindow, long: Bool) -> String {
         if let typed = settings.windowLabels[window.id] { return typed }
         guard settings.shortTabNames else { return window.title }
-        let label = TitleSummary.label(title: window.title, appName: window.appName, bundleID: window.bundleID)
+        let label = TitleSummary.label(title: window.title, appName: window.appName, bundleID: window.bundleID, length: long ? 60 : TitleSummary.limit)
         // Two windows of one messaging app in a category: add which conversation.
         let app = TitleSummary.clean(window.appName)
         if label == app, windows.contains(where: { $0.id != window.id && $0.lane == window.lane && $0.bundleID == window.bundleID }) {
-            let detail = TitleSummary.shortTitle(window.title, appName: window.appName)
+            let detail = TitleSummary.shortTitle(window.title, appName: window.appName, length: long ? 60 : TitleSummary.limit)
             if detail != app { return "\(app) · \(detail)" }
         }
         return label
@@ -1108,13 +1579,33 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         if text.isEmpty { settings.windowLabels.removeValue(forKey: id) } else { settings.windowLabels[id] = text }
         save()
     }
-    func reorderTab(_ values: [String], before target: ManagedWindow, after: Bool = false) -> Bool {
-        guard let value = values.first, let source = windows.first(where: { $0.id == (value.hasPrefix("tab:") ? String(value.dropFirst(4)) : value) }), source.lane == target.lane else { return false }
+    func reorderTab(_ values: [String], before requested: ManagedWindow, after: Bool = false) -> Bool {
+        guard let target = windows.first(where: { $0.id == requested.id }), let value = values.first, let source = windows.first(where: { $0.id == (value.hasPrefix("tab:") ? String(value.dropFirst(4)) : value) }), source.lane == target.lane else { return false }
         let ids = WindowSlots.reordered(items(target.lane).map(\.id), source: source.id, before: target.id, after: after)
         let byID = Dictionary(uniqueKeysWithValues: windows.map { ($0.id, $0) })
         windows = windows.filter { $0.lane != target.lane } + ids.compactMap { byID[$0] }
         settings.windowOrder[target.lane.rawValue] = ids; save()
         status = "\(name(target.lane)) tab order saved. Visible windows stay in place."
+        return true
+    }
+    func beginTabDrag(_ window: ManagedWindow) -> String {
+        if draggedTab != window.id { draggedTab = window.id; onTabDrag?(window.id) }
+        return "tab:" + window.id
+    }
+    func endTabDrag() {
+        guard draggedTab != nil else { return }
+        draggedTab = nil; onTabDrag?(nil)
+    }
+    // A tab dropped on a strip or a drop zone. In its own category it reorders;
+    // anywhere else the window moves to that category and takes its place there.
+    func dropTab(_ values: [String], into lane: Lane, before target: ManagedWindow? = nil, after: Bool = false) -> Bool {
+        endTabDrag()
+        guard let value = values.first, value.hasPrefix("tab:"), let source = windows.first(where: { $0.id == String(value.dropFirst(4)) }) else { return false }
+        if source.lane == lane { return target.map { reorderTab(values, before: $0, after: after) } ?? false }
+        guard enabledLanes.contains(lane) else { return false }
+        // Moving can close the strip the tab came from, so it waits until the
+        // drag has finished.
+        DispatchQueue.main.async { [weak self] in self?.moveWindow(source, to: lane) }
         return true
     }
     func handleStripKey(_ action: StripKeyAction) {
@@ -1152,11 +1643,18 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         // Decide which window keeps the keyboard before the panes change.
         let focused = working ?? focusedWindow().flatMap { slots.contains($0.id) ? $0 : nil }
         let keep = focused ?? activeWindow(lane)
-        let swapped = WindowSlots.swapped(slots, 0, 1)
+        swapSlots(lane, from: 0, to: 1, keeping: keep)
+    }
+    private func swapSlots(_ lane: Lane, from: Int, to: Int, keeping keep: ManagedWindow?) {
+        guard !editingDraft else { return }
+        let slots = slotIDs(lane)
+        guard slots.indices.contains(from), slots.indices.contains(to), from != to else { return }
+        let swapped = WindowSlots.swapped(slots, from, to)
         visibleSlotIDs[lane] = swapped
-        _ = apply(lane, presentationOnly: true, onlyIDs: Set(slots))
-        for id in swapped where id != keep?.id {
-            if let other = items(lane).first(where: { $0.id == id }) { _ = AXUIElementPerformAction(other.element, kAXRaiseAction as CFString) }
+        let changed = Set([slots[from], slots[to]]).subtracting([""])
+        _ = apply(lane, presentationOnly: true, onlyIDs: changed)
+        for id in changed where id != keep?.id && trusted {
+            if let other = items(lane).first(where: { $0.id == id }) { _ = focusAccess.raise(other) }
         }
         if let keep, let slot = swapped.firstIndex(of: keep.id) {
             activeIDs[lane] = keep.id; activeSlot[lane] = slot
@@ -1166,10 +1664,11 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         onLaneControls?()
     }
     // "Show in Left/Right": a window already showing in the other pane swaps over.
-    func show(_ window: ManagedWindow, inPane index: Int) {
+    func show(_ requested: ManagedWindow, inPane index: Int) {
+        guard let window = windows.first(where: { $0.id == requested.id }), enabledLanes.contains(window.lane) else { return }
         let slots = slotIDs(window.lane)
         guard slots.indices.contains(index) else { return }
-        if slots.count == 2, let from = slots.firstIndex(of: window.id), from != index { swapPanes(window.lane, keeping: window); return }
+        if let from = slots.firstIndex(of: window.id), from != index { swapSlots(window.lane, from: from, to: index, keeping: window); return }
         activeSlot[window.lane] = index; reveal(window)
     }
     func nextWindowLabel(_ lane: Lane) -> String {
@@ -1189,10 +1688,10 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { status = "Give the category a name."; return false }
         let category = CustomCategory(name: String(trimmed.prefix(40)))
-        guard let rects = GridGeometry.restoring(category.lane, rects: layoutRects(), active: enabledLanes) else {
+        guard let rects = GridGeometry.restoring(category.lane, rects: baseRects(), active: baseGridLanes) else {
             status = "Make room by resizing a category before adding another one."; return false
         }
-        settings.customCategories.append(category); settings.customRects = rects
+        settings.customCategories.append(category); settings.customRects = rects.merging(floatingRects()) { grid, _ in grid }
         settings.capacities[category.id] = 1
         selectedLane = category.lane; gridSelectionActive = true; layoutHistory = []
         save(); refreshRunningApps(); layoutChanged("\(category.name) created.")
@@ -1231,6 +1730,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     static func sameGrid(_ a: Settings, _ b: Settings) -> Bool {
         a.enabledLanes == b.enabledLanes && a.customCategories == b.customCategories && a.categoryNames == b.categoryNames &&
             a.windowCategories == b.windowCategories && a.placedWindows == b.placedWindows && a.placements == b.placements && a.gap == b.gap &&
+            Set(a.floatingLanes).intersection(a.enabledLanes.map(\.rawValue)) == Set(b.floatingLanes).intersection(b.enabledLanes.map(\.rawValue)) &&
             a.enabledLanes.allSatisfy { a.unitRect(for: $0) == b.unitRect(for: $0) && a.capacity($0) == b.capacity($0) }
     }
     // Apply: the draft becomes the grid your screen uses, and windows are arranged into it.
@@ -1254,6 +1754,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         settings.placedWindows = draft.placedWindows
         settings.gap = draft.gap
         overrides = settings.windowCategories.compactMapValues(Lane.init(rawValue:))
+        reclassifyInventory()
         // Draft editing intentionally restores the live slot state. Apply must
         // now normalize it for the new count without losing the chosen pane.
         for lane in enabledLanes {
@@ -1286,7 +1787,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     }
     func editorRect(_ lane: Lane) -> CGRect { editorPreview?[lane.rawValue]?.cgRect ?? grid.unitRect(for: lane) }
     func commitGridResize(_ rects: [String: ZoneRect], lane: Lane) {
-        guard GridGeometry.valid(rects, lanes: enabledLanes), rects != layoutRects() else { editorPreview = nil; return }
+        guard GridGeometry.valid(rects, lanes: enabledLanes, floating: Set(settings.floatingLanes)), rects != layoutRects() else { editorPreview = nil; return }
         rememberLayout(); settings.customRects = rects; editorPreview = nil
         layoutChanged("\(name(lane)) and its shared borders resized.")
     }
@@ -1296,7 +1797,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     }
     func validEdit(_ lane: Lane, rect: CGRect) -> Bool {
         var rects = layoutRects(); rects[lane.rawValue] = ZoneRect(rect)
-        return GridGeometry.valid(rects, lanes: grid.enabledLanes)
+        return GridGeometry.valid(rects, lanes: grid.enabledLanes, floating: floatingKeys)
     }
     func editCategory(_ lane: Lane, rect: CGRect) {
         guard enabledLanes.contains(lane), validEdit(lane, rect: rect) else {
@@ -1309,6 +1810,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         settings.customRects = rects; layoutChanged("\(name(lane)) resized / positioned.")
     }
     func layoutChanged(_ message: String) {
+        if !editingDraft { cancelFocus() }
         settings.useCustomGrid = true
         save(); selectedTemplateChanged = true
         status = message + " Organize keeps these sizes. Auto layout chooses a new grid."
@@ -1319,13 +1821,10 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         settings.customCategories = old.customCategories; settings.showMediaShelf = old.showMediaShelf
         settings.windowCategories = old.windowCategories
         overrides = old.windowCategories.compactMapValues(Lane.init(rawValue:))
-        for index in windows.indices {
-            let category = overrides[windows[index].id] ?? Classifier.lane(bundleID: windows[index].bundleID, appName: windows[index].appName, title: windows[index].title, rules: settings.appRules)
-            windows[index].lane = enabledLanes.contains(category) ? category : enabledLanes[0]
-        }
+        reclassifyInventory()
         if !enabledLanes.contains(selectedLane) { selectedLane = enabledLanes[0] }
         settings.customRects = old.customRects; settings.template = old.template
-        settings.splits = old.splits; settings.placements = old.placements
+        settings.splits = old.splits; settings.placements = old.placements; settings.floatingLanes = old.floatingLanes
         settings.capacities = old.capacities
         layoutChanged("Previous grid restored.")
     }
@@ -1333,7 +1832,46 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     struct SnapHint: Equatable { let lane: Lane; let plan: GridGeometry.SnapPlan }
     @Published var snapHint: SnapHint?
     func snapPlan(_ lane: Lane, candidate: CGRect, at point: CGPoint) -> GridGeometry.SnapPlan {
-        GridGeometry.snapPlan(lane, candidate: candidate, at: point, rects: layoutRects(), lanes: grid.enabledLanes)
+        // A floating category goes wherever it is dropped.
+        if isFloating(lane) { return .move(candidate) }
+        return GridGeometry.snapPlan(lane, candidate: candidate, at: point, rects: baseRects(), lanes: baseGridLanes)
+    }
+    // A resize: a grid category moves its shared borders with its neighbors;
+    // a floating one moves only its own edge.
+    func resizedGrid(_ start: [String: ZoneRect], lane: Lane, edge: ResizeEdge, dx: Double, dy: Double) -> [String: ZoneRect] {
+        let floating = floatingKeys
+        if floating.contains(lane.rawValue) {
+            guard let rect = start[lane.rawValue]?.cgRect else { return start }
+            var result = start; result[lane.rawValue] = ZoneRect(GridGeometry.resizedAlone(rect, edge: edge, dx: dx, dy: dy, snap: settings.snapToGrid))
+            return result
+        }
+        return GridGeometry.resizing(start.filter { !floating.contains($0.key) }, lane: lane, edge: edge, dx: dx, dy: dy, snap: settings.snapToGrid)
+            .merging(start.filter { floating.contains($0.key) }) { grid, _ in grid }
+    }
+    // Float a category over the grid, or put it back in. Floating leaves its
+    // region where it was; its neighbors grow into the space it left.
+    func setFloating(_ lane: Lane, _ on: Bool) {
+        guard enabledLanes.contains(lane), settings.isFloating(lane) != on else { return }
+        let rect = layoutRects()[lane.rawValue]?.cgRect ?? settings.unitRect(for: lane)
+        let others = floatingRects()
+        if on {
+            guard baseGridLanes.count > 1 else { status = "Keep one category in the grid for \(name(lane)) to float over."; return }
+            var base = baseRects(); base.removeValue(forKey: lane.rawValue)
+            base = GridGeometry.filling(rect, rects: base)
+            rememberLayout()
+            settings.floatingLanes.append(lane.rawValue)
+            var rects = base.merging(others) { grid, _ in grid }; rects[lane.rawValue] = ZoneRect(rect)
+            settings.customRects = rects
+            layoutChanged("\(name(lane)) floats over the grid. Switching to one of its windows brings it on top.")
+        } else {
+            guard let restored = GridGeometry.restoring(lane, rects: baseRects(), active: baseGridLanes, at: CGPoint(x: rect.midX, y: rect.midY)) else {
+                status = "Make room in the grid, then put \(name(lane)) back."; return
+            }
+            rememberLayout()
+            settings.floatingLanes.removeAll { $0 == lane.rawValue }
+            settings.customRects = restored.merging(others.filter { $0.key != lane.rawValue }) { grid, _ in grid }
+            layoutChanged("\(name(lane)) is back in the grid.")
+        }
     }
     func dropCategory(_ lane: Lane, candidate: CGRect, at point: CGPoint) {
         snapHint = nil
@@ -1341,7 +1879,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         case .move(let rect): editCategory(lane, rect: rect)
         case .swap(let target): swapCategories(lane, target)
         case .fit(let rects):
-            rememberLayout(); settings.customRects = rects
+            rememberLayout(); settings.customRects = rects.merging(floatingRects()) { grid, _ in grid }
             layoutChanged("\(name(lane)) moved into the free space.")
         case .none: status = "\(name(lane)) does not fit there. Drop it on another category to swap them."
         }
@@ -1352,6 +1890,11 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         var rects = layoutRects()
         let sourceRect = rects[source.rawValue]; rects[source.rawValue] = rects[target.rawValue]; rects[target.rawValue] = sourceRect
         settings.customRects = rects
+        // Floating belongs to the place: the category that takes a floating spot floats.
+        if settings.isFloating(source) != settings.isFloating(target) {
+            let (from, to) = settings.isFloating(source) ? (source, target) : (target, source)
+            settings.floatingLanes.removeAll { $0 == from.rawValue }; settings.floatingLanes.append(to.rawValue)
+        }
         layoutChanged("\(name(source)) and \(name(target)) swapped.")
     }
     func resetPlacements() {
@@ -1391,7 +1934,8 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     func currentGridLayout(name: String, from source: Settings? = nil) -> SavedGridLayout {
         let source = source ?? settings
         let rects = Dictionary(uniqueKeysWithValues: source.enabledLanes.map { ($0.rawValue, ZoneRect(source.unitRect(for: $0))) })
-        return SavedGridLayout(name: name, rects: rects, capacities: source.capacities, lanes: source.enabledLanes.map(\.rawValue), gap: source.gap, categories: source.customCategories, categoryNames: source.categoryNames, windowCategories: source.windowCategories)
+        let floating = source.floatingLanes.filter { key in source.enabledLanes.contains { $0.rawValue == key } }
+        return SavedGridLayout(name: name, rects: rects, capacities: source.capacities, lanes: source.enabledLanes.map(\.rawValue), gap: source.gap, categories: source.customCategories, categoryNames: source.categoryNames, windowCategories: source.windowCategories, floating: floating.isEmpty ? nil : floating)
     }
     @discardableResult func saveGridLayout(name input: String) -> Bool {
         let name = String(input.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60))
@@ -1414,7 +1958,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         let lanes = layout.lanes.compactMap(Lane.init(rawValue:))
         let available = Lane.allCases + layout.categories.map(\.lane) + settings.customCategories.map(\.lane)
         guard !lanes.isEmpty, lanes.allSatisfy({ available.contains($0) }),
-              GridGeometry.valid(layout.rects, lanes: lanes) else { status = "This saved layout contains unavailable categories or invalid regions."; return }
+              GridGeometry.valid(layout.rects, lanes: lanes, floating: Set(layout.floating ?? [])) else { status = "This saved layout contains unavailable categories or invalid regions."; return }
         rememberLayout(); settings.previousLayout = currentGridLayout(name: "Previous layout")
         for category in layout.categories where !settings.customCategories.contains(where: { $0.id == category.id }) { settings.customCategories.append(category) }
         settings.categoryNames.merge(layout.categoryNames, uniquingKeysWith: { _, saved in saved })
@@ -1423,14 +1967,19 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         settings.hiddenLanes = availableLanes.filter { !lanes.contains($0) }.map(\.rawValue)
         settings.shelvedLanes = settings.hiddenLanes
         settings.showMediaShelf = lanes.contains(.media)
-        settings.customRects = layout.rects; settings.capacities = layout.capacities
+        settings.customRects = layout.rects; settings.capacities = layout.capacities; settings.floatingLanes = layout.floating ?? []
         settings.gap = min(28, max(4, layout.gap)); editorPreview = nil
-        for index in windows.indices {
-            let category = overrides[windows[index].id] ?? Classifier.lane(bundleID: windows[index].bundleID, appName: windows[index].appName, title: windows[index].title, rules: settings.appRules)
-            windows[index].lane = lanes.contains(category) ? category : lanes[0]
-        }
+        reclassifyInventory()
         if !lanes.contains(selectedLane) { selectedLane = lanes[0] }
         layoutChanged("\(layout.name) loaded.")
+    }
+    private func reclassifyInventory() {
+        var inside: [ManagedWindow] = [], outside: [ManagedWindow] = []
+        for var window in windows + outsideGrid {
+            window.lane = overrides[window.id] ?? Classifier.lane(bundleID: window.bundleID, appName: window.appName, title: window.title, rules: settings.appRules)
+            if enabledLanes.contains(window.lane) { inside.append(window) } else { outside.append(window) }
+        }
+        windows = inside; outsideGrid = outside
     }
     func restorePreviousLayout() {
         if let layout = settings.previousLayout { loadGridLayout(layout) }

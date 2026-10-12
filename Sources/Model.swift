@@ -91,9 +91,18 @@ enum Template: String, CaseIterable, Codable, Identifiable {
 }
 
 enum WindowStripStyle: String, Codable, CaseIterable, Identifiable {
-    case compact, detailed, expanding
+    case compact, detailed, expanding, line
     var id: String { rawValue }
     var title: String { self == .expanding ? "Expand on hover" : rawValue.capitalized }
+    // Grows into the full strip (or its window list) while you hover it.
+    var expandsOnHover: Bool { self == .expanding || self == .line }
+}
+// When hovering an Expand-on-hover strip opens a list of whole window names:
+// only where the tabs would be too narrow to read, always, or never.
+enum StripListMode: String, Codable, CaseIterable, Identifiable {
+    case narrow, always, never
+    var id: String { rawValue }
+    var title: String { self == .narrow ? "Narrow tiles" : self == .always ? "Always" : "Off" }
 }
 struct WindowStripMetrics {
     var width: Double
@@ -104,17 +113,50 @@ struct WindowStripMetrics {
     // name, pane chooser and counter (unscaled points).
     static let chipWidth = 200.0
     static func chipRoom(slots: Int) -> Double { 175 + (slots == 2 ? 128 : slots > 2 ? 32 : 0) }
+    // Tab names are 11 points at 100% and never under 10, whatever the Strip
+    // size; the strip keeps its height. Tabs widen with the text, so a name
+    // shows as many letters as before. Both are in screen points.
+    static func tabText(scale: Double) -> Double { max(10, 11 * scale) }
+    static func chipLimit(scale: Double) -> Double { chipWidth * tabText(scale: scale) / 9 }
+    static func barLimit(scale: Double) -> Double { 760 * tabText(scale: scale) / 9 }
     static func measure(style: WindowStripStyle, count: Int, scale: Double, availableWidth: Double, slots: Int = 1) -> WindowStripMetrics {
         let scale = min(1.5, max(0.8, scale.isFinite ? scale : 1))
+        if style == .line { return line(count: count, scale: scale, availableWidth: availableWidth) }
         let dotsWidth = 24.0 + 18 + Double(max(0, min(16, count) - 1)) * 11
         // Expand on hover is laid out at its compact size; only hovering grows it.
         let small = style != .detailed
         // Detailed is as wide as its chips need, up to a full bar.
-        let chips = min(760, chipRoom(slots: 1) + Double(max(2, min(16, count))) * chipWidth)
-        let width = (small ? max(190, dotsWidth + 110) : chips) + (slots > 1 ? (slots == 2 ? 128 : 32) : 0)
+        let chips = min(barLimit(scale: scale), chipRoom(slots: 1) * scale + Double(max(2, min(16, count))) * chipLimit(scale: scale))
+        let panes = Double(slots > 1 ? (slots == 2 ? 128 : 32) : 0) * scale
+        let width = (small ? max(190, dotsWidth + 110) * scale : chips) + panes
         // Both styles are one rounded row; Detailed is only wider.
         let height = 32.0
-        return WindowStripMetrics(width: max(1, min(availableWidth, width * scale)), height: height * scale)
+        return WindowStripMetrics(width: max(1, min(availableWidth, width)), height: height * scale)
+    }
+    // Line: a thin bar in the category's color, one segment per window. The
+    // panel is taller than the bar so it is easy to hover.
+    static func line(count: Int, scale: Double, availableWidth: Double) -> WindowStripMetrics {
+        let width = min(180, max(64, Double(min(16, max(1, count))) * 16)) * scale
+        return WindowStripMetrics(width: max(1, min(availableWidth, width)), height: 14 * scale)
+    }
+    // A tab narrower than this cannot show a readable name (screen points).
+    static let readableTab = 80.0
+    static func listRow(scale: Double) -> Double { max(22, 26 * scale) }
+    // On a narrow tile, many tabs in one row shrink to a letter each. Then
+    // hovering opens a list instead: one window per line with its whole name,
+    // free to grow past the tile's edge.
+    static func usesList(count: Int, scale: Double, availableWidth: Double, slots: Int = 1) -> Bool {
+        guard count > 1 else { return false }
+        let scale = min(1.5, max(0.8, scale.isFinite ? scale : 1))
+        let room = min(availableWidth, barLimit(scale: scale)) - chipRoom(slots: slots) * scale
+        return room / Double(min(16, count)) < readableTab
+    }
+    static func list(count: Int, scale: Double, availableWidth: Double, slots: Int = 1) -> WindowStripMetrics {
+        let scale = min(1.5, max(0.8, scale.isFinite ? scale : 1))
+        let rows = Double(min(16, max(1, count)))
+        let compact = measure(style: .expanding, count: count, scale: scale, availableWidth: .infinity, slots: slots).width
+        let width = max(compact, availableWidth, 320 * tabText(scale: scale) / 11)
+        return WindowStripMetrics(width: width, height: 32 * scale + rows * listRow(scale: scale) + 8)
     }
 }
 
@@ -123,6 +165,23 @@ struct SeenWindow: Equatable {
     let id: String
     let pid: Int32
     let frame: CGRect
+    var number: UInt32? = nil
+}
+
+enum WindowVisibility {
+    static func matches(number: UInt32?, onScreen: Set<UInt32>, frame: CGRect, fallbackFrames: [CGRect]) -> Bool {
+        // Matching the origin alone invents visible native tabs and can put a
+        // window from another Space into a category on the current desktop.
+        if let number { return onScreen.contains(number) }
+        return fallbackFrames.contains { TabSwitch.sameSpot($0, frame) }
+    }
+}
+
+enum WindowPlacement {
+    static func fits(_ actual: CGRect, in target: CGRect) -> Bool {
+        actual.width > 0 && actual.height > 0 && actual.width <= target.width + 12 && actual.height <= target.height + 12 &&
+            abs(actual.minX - target.minX) < 12 && abs(actual.minY - target.minY) < 12
+    }
 }
 
 enum TabSwitch {
@@ -135,7 +194,9 @@ enum TabSwitch {
     static func pairs(vanished: [SeenWindow], appeared: [SeenWindow]) -> [String: String] {
         var result: [String: String] = [:], used: Set<String> = []
         for window in appeared {
-            guard let match = vanished.first(where: { !used.contains($0.id) && $0.pid == window.pid && sameSpot($0.frame, window.frame) }) else { continue }
+            let candidates = vanished.filter { !used.contains($0.id) && $0.pid == window.pid && sameSpot($0.frame, window.frame) }
+            guard candidates.count == 1, let match = candidates.first,
+                  appeared.filter({ $0.pid == match.pid && sameSpot($0.frame, match.frame) }).count == 1 else { continue }
             used.insert(match.id); result[window.id] = match.id
         }
         return result
@@ -147,9 +208,15 @@ enum StackOrder {
     // own window list is front-to-back too, so windows of one app stacked in
     // the same spot are told apart by their order within that app.
     // `windows` must be in each app's own order; returns id → position (0 = front).
-    static func positions(windows: [SeenWindow], onScreen: [(pid: Int32, frame: CGRect)]) -> [String: Int] {
+    static func positions(windows: [SeenWindow], onScreen: [(pid: Int32, frame: CGRect)], numbers: [UInt32: Int] = [:]) -> [String: Int] {
         var used: Set<Int> = [], result: [String: Int] = [:]
         for window in windows {
+            if let number = window.number {
+                if let index = numbers[number], onScreen.indices.contains(index), onScreen[index].pid == window.pid, !used.contains(index) {
+                    used.insert(index); result[window.id] = index
+                }
+                continue
+            }
             guard let index = onScreen.indices.first(where: { !used.contains($0) && onScreen[$0].pid == window.pid && TabSwitch.sameSpot(onScreen[$0].frame, window.frame) }) else { continue }
             used.insert(index); result[window.id] = index
         }
@@ -190,14 +257,14 @@ enum TitleSummary {
         text.replacingOccurrences(of: #"\p{Cf}"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
     }
     // Messaging apps show their own name; everything else its title, shortened.
-    static func label(title: String, appName: String, bundleID: String) -> String {
-        isMessagingApp(bundleID: bundleID, appName: appName) ? clean(appName) : shortTitle(title, appName: appName)
+    static func label(title: String, appName: String, bundleID: String, length: Int = limit) -> String {
+        isMessagingApp(bundleID: bundleID, appName: appName) ? clean(appName) : shortTitle(title, appName: appName, length: length)
     }
     // The first meaningful part of a title: no agent status symbols or unread
     // counts in front, no app names, prices or user names after a separator.
     // A one-word name keeps the next part ("Atlas · Version Showcase"). Cut at
     // a word near `limit` characters, never ending on a filler like "and".
-    static func shortTitle(_ title: String, appName: String) -> String {
+    static func shortTitle(_ title: String, appName: String, length: Int = limit) -> String {
         let app = clean(appName)
         var text = clean(title).replacingOccurrences(of: #"^[^\p{L}\p{N}(]+"#, with: "", options: .regularExpression)
         text = text.replacingOccurrences(of: #"^\(\d+\+?\)\s*"#, with: "", options: .regularExpression)
@@ -212,12 +279,12 @@ enum TitleSummary {
             short += " · " + parts[1]
         }
         // A long list stops at its first comma ("CITY APARTMENT HUNTING, Street…").
-        if short.count > limit, let comma = short.firstIndex(of: ","), short.distance(from: short.startIndex, to: comma) >= 3 {
+        if short.count > length, let comma = short.firstIndex(of: ","), short.distance(from: short.startIndex, to: comma) >= 3 {
             short = String(short[..<comma])
         }
-        if short.count > limit {
-            let head = String(short.prefix(limit + 1))
-            short = head.lastIndex(of: " ").map { String(head[..<$0]) } ?? String(short.prefix(limit))
+        if short.count > length {
+            let head = String(short.prefix(length + 1))
+            short = head.lastIndex(of: " ").map { String(head[..<$0]) } ?? String(short.prefix(length))
         }
         var words = short.split(separator: " ").map(String.init)
         while words.count > 1, let last = words.last, trailingFillers.contains(last.lowercased()) || last == "·" { words.removeLast() }
@@ -229,17 +296,26 @@ enum TitleSummary {
 // your own. The main category (selected in the sidebar) gets the most room, and
 // categories with more windows get more room than empty ones.
 enum PresetShape: String, CaseIterable, Identifiable {
-    case columns, focus, mainSide
+    case columns, focus, mainSide, overlay
     var id: String { rawValue }
-    var title: String { self == .columns ? "Columns" : self == .focus ? "Focus" : "Main + side" }
+    var title: String { self == .columns ? "Columns" : self == .focus ? "Focus" : self == .mainSide ? "Main + side" : "Overlay" }
     var subtitle: String {
         switch self {
         case .columns: return "Every category side by side; busier ones are wider"
         case .focus: return "Your main category in the middle, the rest on both sides"
         case .mainSide: return "Your main category on the left, the rest stacked on the right"
+        case .overlay: return "Browser (or your main category) fills the screen; the rest float over it on the right"
         }
     }
-    var symbol: String { self == .columns ? "rectangle.split.3x1" : self == .focus ? "rectangle.center.inset.filled" : "rectangle.lefthalf.inset.filled" }
+    var symbol: String { self == .columns ? "rectangle.split.3x1" : self == .focus ? "rectangle.center.inset.filled" : self == .mainSide ? "rectangle.lefthalf.inset.filled" : "rectangle.on.rectangle" }
+    // A MacBook-shaped screen has no room for Focus's three bands.
+    static func shapes(for kind: DisplayKind) -> [PresetShape] { kind == .wide ? allCases : [.mainSide, .overlay, .columns] }
+    // The categories this preset floats over the grid.
+    func floating(lanes: [Lane], main: Lane) -> [String] {
+        guard self == .overlay, lanes.count > 1 else { return [] }
+        let main = lanes.contains(main) ? main : lanes[0]
+        return lanes.filter { $0 != main }.map(\.rawValue)
+    }
 
     static func weight(_ count: Int) -> Double { (1 + Double(max(0, count))).squareRoot() }
 
@@ -268,6 +344,9 @@ enum PresetShape: String, CaseIterable, Identifiable {
         }
         if lanes.count == 1 { out[main.rawValue] = ZoneRect(CGRect(x: 0, y: 0, width: 1, height: 1)); return out }
         switch self {
+        case .overlay:
+            out[main.rawValue] = ZoneRect(CGRect(x: 0, y: 0, width: 1, height: 1))
+            column(others, x: 0.59375, width: 0.40625)
         case .columns:
             columns(lanes, x0: 0, width: 1)
         case .focus:
@@ -308,14 +387,16 @@ struct DisplayLayout: Codable, Equatable {
     var showMediaShelf: Bool
     var useCustomGrid: Bool
     var stripPositions: [String: StripPosition]
+    var floatingLanes: [String]? = nil
 }
 extension Settings {
     func displayLayout(kind: DisplayKind) -> DisplayLayout {
-        DisplayLayout(kind: kind, customRects: customRects, capacities: capacities, hiddenLanes: hiddenLanes, shelvedLanes: shelvedLanes, showMediaShelf: showMediaShelf, useCustomGrid: useCustomGrid, stripPositions: stripPositions)
+        DisplayLayout(kind: kind, customRects: customRects, capacities: capacities, hiddenLanes: hiddenLanes, shelvedLanes: shelvedLanes, showMediaShelf: showMediaShelf, useCustomGrid: useCustomGrid, stripPositions: stripPositions, floatingLanes: floatingLanes)
     }
     mutating func apply(_ d: DisplayLayout) {
         customRects = d.customRects; capacities = d.capacities; hiddenLanes = d.hiddenLanes; shelvedLanes = d.shelvedLanes
         showMediaShelf = d.showMediaShelf; useCustomGrid = d.useCustomGrid; stripPositions = d.stripPositions
+        floatingLanes = d.floatingLanes ?? []
     }
     // A laptop starting point from the categories in use: the main one (Browser when
     // present) on the left at 60%, Terminal and Messaging stacked on the right, one
@@ -345,6 +426,7 @@ extension Settings {
         for lane in kept { layout.capacities[lane.rawValue] = 1 }
         layout.useCustomGrid = true
         layout.stripPositions = [:]
+        layout.floatingLanes = []
         return layout
     }
     // Moves the grid to another display and keeps the one it leaves. A display seen
@@ -468,6 +550,26 @@ enum TileMembership {
     }
 }
 
+// The display a window belongs to: the one it covers most, or the nearest one
+// when it is off every display. A window hanging below the Dock or past an
+// edge still belongs to the screen it hangs off. Frames use top-left coordinates.
+enum WindowDisplay {
+    static func owner(of frame: CGRect, displays: [CGRect]) -> Int? {
+        guard !displays.isEmpty else { return nil }
+        let areas = displays.map { display -> Double in
+            let shared = display.intersection(frame)
+            return shared.isNull ? 0 : Double(shared.width * shared.height)
+        }
+        if let best = areas.indices.max(by: { areas[$0] < areas[$1] }), areas[best] > 0 { return best }
+        let center = CGPoint(x: frame.midX, y: frame.midY)
+        func distance(_ display: CGRect) -> Double {
+            let dx = max(display.minX - center.x, 0, center.x - display.maxX), dy = max(display.minY - center.y, 0, center.y - display.maxY)
+            return Double(dx * dx + dy * dy)
+        }
+        return displays.indices.min { distance(displays[$0]) < distance(displays[$1]) }
+    }
+}
+
 enum StrayWindow {
     // A window outside every category covers the grid when at least a quarter
     // of it sits on category regions.
@@ -524,6 +626,8 @@ enum StripPlacementGeometry {
         let bounds = bounds.insetBy(dx: edgeMargin, dy: 0)
         var frame = CGRect(x: rest.minX, y: rest.minY, width: size.width, height: size.height)
         if frame.maxX > bounds.maxX { frame.origin.x = max(bounds.minX, bounds.maxX - frame.width) }
+        // A list that would run off the bottom opens upward from there.
+        if frame.maxY > bounds.maxY { frame.origin.y = max(bounds.minY, bounds.maxY - frame.height) }
         return frame
     }
     static func position(of frame: CGRect, in region: CGRect) -> StripPosition {
@@ -541,6 +645,7 @@ struct SavedGridLayout: Codable, Identifiable {
     var categories: [CustomCategory]
     var categoryNames: [String: String]
     var windowCategories: [String: String]
+    var floating: [String]? = nil
 }
 
 struct Settings: Codable {
@@ -575,12 +680,22 @@ struct Settings: Codable {
     var hiddenLanes: [String] = [Lane.browser.rawValue]
     var shelvedLanes: [String] = []
     var customRects: [String: ZoneRect] = [:]
+    // Categories that float over the grid instead of taking a part of it, like
+    // Terminal over a full-screen Browser. Their regions may overlap the rest.
+    var floatingLanes: [String] = []
+    // Apps Lanes leaves alone (bundle IDs): no strip tab, never moved,
+    // centered or put back.
+    var ignoredApps: [String] = []
+    var stripList: StripListMode = .narrow
     var customCategories: [CustomCategory] = []
     var categoryNames: [String: String] = [:]
     var snapToGrid = true
     var doubleRightCommand = true
+    // Put back windows that agents (Codex, Claude, any computer-use tool) or
+    // apps move out of their tiles. Only your own mouse and keyboard rearrange.
+    var keepLayout = true
     init() {}
-    enum CodingKeys: String, CodingKey { case savedLayouts, previousLayout, template, gap, capacities, appRules, screenID, splits, autoArrange, centerNewWindows, onlyTargetScreen, showLaneControls, shortTabNames, hasSeenTour, displayLayouts, activeDisplayKey, placedWindows, stripPlacement, stripPositions, windowStripStyle, windowStripScale, categoryStripStyles, useCustomGrid, windowCategories, windowLabels, windowOrder, showMediaShelf, placements, hiddenLanes, shelvedLanes, customRects, snapToGrid, doubleRightCommand, customCategories, categoryNames }
+    enum CodingKeys: String, CodingKey { case savedLayouts, previousLayout, template, gap, capacities, appRules, screenID, splits, autoArrange, centerNewWindows, onlyTargetScreen, showLaneControls, shortTabNames, hasSeenTour, displayLayouts, activeDisplayKey, placedWindows, stripPlacement, stripPositions, windowStripStyle, windowStripScale, categoryStripStyles, useCustomGrid, windowCategories, windowLabels, windowOrder, showMediaShelf, placements, hiddenLanes, shelvedLanes, customRects, snapToGrid, doubleRightCommand, keepLayout, customCategories, categoryNames, floatingLanes, ignoredApps, stripList }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         savedLayouts = try c.decodeIfPresent([SavedGridLayout].self, forKey: .savedLayouts) ?? []
@@ -623,12 +738,17 @@ struct Settings: Codable {
         categoryNames = try c.decodeIfPresent([String: String].self, forKey: .categoryNames) ?? [:]
         if enabledLanes.isEmpty { hiddenLanes.removeAll(); shelvedLanes.removeAll() }
         customRects = try c.decodeIfPresent([String: ZoneRect].self, forKey: .customRects) ?? [:]
+        floatingLanes = try c.decodeIfPresent([String].self, forKey: .floatingLanes) ?? []
+        ignoredApps = try c.decodeIfPresent([String].self, forKey: .ignoredApps) ?? []
+        stripList = (try? c.decode(StripListMode.self, forKey: .stripList)) ?? .narrow
         useCustomGrid = try c.decodeIfPresent(Bool.self, forKey: .useCustomGrid) ?? !customRects.isEmpty
         snapToGrid = try c.decodeIfPresent(Bool.self, forKey: .snapToGrid) ?? true
         doubleRightCommand = try c.decodeIfPresent(Bool.self, forKey: .doubleRightCommand) ?? true
-        if !customRects.isEmpty && !GridGeometry.valid(customRects, lanes: enabledLanes) { customRects = [:] }
+        keepLayout = try c.decodeIfPresent(Bool.self, forKey: .keepLayout) ?? true
+        if !customRects.isEmpty && !GridGeometry.valid(customRects, lanes: enabledLanes, floating: Set(floatingLanes)) { customRects = [:]; floatingLanes = [] }
     }
     var availableLanes: [Lane] { Lane.allCases + customCategories.map(\.lane) }
+    func isFloating(_ lane: Lane) -> Bool { floatingLanes.contains(lane.rawValue) }
     var newWindowPlacement: NewWindowPlacement {
         get { autoArrange ? .category : centerNewWindows ? .center : .leave }
         set { autoArrange = newValue == .category; centerNewWindows = newValue == .center }
@@ -701,7 +821,7 @@ struct Layout {
         let valid = Set(ids)
         let selected = foreground.filter { valid.contains($0) }
         let touched = (presentationOnly ? selected : ids).filter { onlyIDs?.contains($0) ?? true }
-        for (index, id) in touched.enumerated() { placements[id] = tiles[foreground.firstIndex(of: id) ?? (index % tiles.count)] }
+        for id in touched { placements[id] = tiles[foreground.firstIndex(of: id) ?? ((ids.firstIndex(of: id) ?? 0) % tiles.count)] }
         return StackPlan(foregroundIDs: selected, frames: placements, raiseOrder: touched.filter { !selected.contains($0) } + selected.filter { touched.contains($0) })
     }
     static func reflow(index: Int, count: Int) -> CGRect {
@@ -796,6 +916,84 @@ struct Layout {
     }
 }
 
+// Who moved a window? Your mouse and keyboard arrive from the hardware, with no
+// sending process. Computer-use agents move windows through accessibility, or
+// post synthetic input that carries the process that posted it.
+struct UserInputClock {
+    static let grace: Double = 0.8
+    private(set) var buttonHeld = false
+    private(set) var lastPointer = -Double.infinity
+    private(set) var lastShortcut = -Double.infinity
+    private(set) var lastPress = -Double.infinity
+    private(set) var lastMouseDown = -Double.infinity
+    func mouseDown(within seconds: Double, at time: Double) -> Bool { time - lastMouseDown < seconds }
+    mutating func press(sourcePID: Int64, at time: Double) {
+        if sourcePID == 0 { lastPress = time }
+    }
+    // held: true for a left-button press, false for its release, nil otherwise.
+    mutating func pointer(held: Bool?, sourcePID: Int64, at time: Double) {
+        guard sourcePID == 0 else { return }
+        lastPointer = time
+        if let held { buttonHeld = held }
+        if held == true { lastMouseDown = time; press(sourcePID: sourcePID, at: time) }
+    }
+    // A press after a window was asked for means you have chosen something else.
+    func pressed(since time: Double) -> Bool { lastPress > time }
+    // Plain typing never moves windows; shortcuts with Command, Control or Option can.
+    mutating func key(modified: Bool, sourcePID: Int64, at time: Double) {
+        guard sourcePID == 0 else { return }
+        press(sourcePID: sourcePID, at: time)
+        if modified { lastShortcut = time }
+    }
+    // `buttonDown` is whether any button is down right now, so a missed release
+    // can never leave a stale drag behind.
+    func dragging(buttonDown: Bool) -> Bool { buttonHeld && buttonDown }
+    func pointerActive(at time: Double, buttonDown: Bool) -> Bool { dragging(buttonDown: buttonDown) || time - lastPointer < Self.grace }
+    func shortcutActive(at time: Double) -> Bool { time - lastShortcut < Self.grace }
+    func userActive(at time: Double, buttonDown: Bool) -> Bool { pointerActive(at: time, buttonDown: buttonDown) || shortcutActive(at: time) }
+    // A click or drag explains a move only if it was on that window (its title
+    // bar, zoom button, edges) or in the menu bar of its app. Your clicks in
+    // another app while an agent moves a window do not.
+    func causedMove(at time: Double, buttonDown: Bool, pointerOnWindow: Bool, pointerInItsMenuBar: Bool) -> Bool {
+        shortcutActive(at: time) || (pointerActive(at: time, buttonDown: buttonDown) && (pointerOnWindow || pointerInItsMenuBar))
+    }
+}
+
+// An app brought forward with Command+Tab or the Dock puts its own last window
+// in front, which may be another tab of a category than the one its strip has
+// selected (two Ghostty processes each keep their own). Lanes shows the selected
+// tab again, unless you clicked a window of that app or Lanes asked for it, or
+// the window in front is showing in another pane of the same category.
+enum ActivationRestore {
+    static func shouldRestore(front: String?, selected: String?, visible: [String], clickedWindow: Bool, lanesAsked: Bool) -> Bool {
+        guard let front, let selected, front != selected, !visible.contains(front) else { return false }
+        return !clickedWindow && !lanesAsked
+    }
+}
+
+enum FocusConfirm {
+    // An app that just became active can put its own main window back on top a
+    // moment later (Arc does, about 0.1 s after activating, over a Little Arc
+    // window and over the window showing in another pane). The window you asked
+    // for is checked at these times and raised again while its app is in
+    // front, another of its windows is on top, and you have not clicked since.
+    // Every 30 ms at first, so a covered pane is put back before you see it.
+    static let checks: [Double] = (1...20).map { Double($0) * 0.03 } + [0.8, 1.3, 2.0]
+    static func shouldRaise(appInFront: Bool, topWindow: UInt32?, wanted: UInt32, pressedSince: Bool) -> Bool {
+        appInFront && !pressedSince && topWindow != nil && topWindow != wanted
+    }
+    // The app may also bring forward a window of its own that sits in another
+    // pane (Arc brings the one it used last). Panes that now show such a window
+    // get back the window they were showing; these are the windows to raise.
+    static func covered(before: [String: UInt32], after: [String: UInt32], wanted: UInt32, sameApp: Set<UInt32>, excluding: Set<String> = []) -> [UInt32] {
+        let covered: [UInt32] = before.compactMap { pane, was in
+            guard !excluding.contains(pane), let now = after[pane], now != was, now != wanted, was != wanted, sameApp.contains(now) else { return nil }
+            return was
+        }
+        return Set(covered).sorted()
+    }
+}
+
 struct WindowSlots {
     static func normalized(_ saved: [String], ids: [String], capacity: Int) -> [String] {
         var seen: Set<String> = []
@@ -837,7 +1035,19 @@ struct Classifier {
         let text = title.lowercased()
         return ["picture-in-picture", "picture in picture", "pip player", "mini player", "miniplayer"].contains(where: text.contains)
     }
+    // A standard window, or one its app labels a dialog that still behaves like
+    // a window: Arc's Little Arc can be minimized, zoomed and resized. Alerts
+    // and open panels cannot, so they stay out.
+    static func isWindow(subrole: String?, modal: Bool, minimizable: Bool, zoomable: Bool, resizable: Bool) -> Bool {
+        if subrole == "AXStandardWindow" { return true }
+        return (subrole == "AXDialog" || subrole == "AXSystemDialog") && !modal && minimizable && zoomable && resizable
+    }
     static func lane(bundleID: String, appName: String, title: String, rules: [String: String]) -> Lane {
+        knownLane(bundleID: bundleID, appName: appName, title: title, rules: rules) ?? .desktop
+    }
+    // The category your rules or the app's kind give it; nil for an app Lanes
+    // does not recognize, which falls back to Desktop.
+    static func knownLane(bundleID: String, appName: String, title: String, rules: [String: String]) -> Lane? {
         if let rule = rules[bundleID], let lane = Lane(rawValue: rule) { return lane }
         let app = (bundleID + " " + appName).lowercased()
         if isCompactPlayer(title: title) || app.contains("com.spotify.client") { return .media }
@@ -846,7 +1056,7 @@ struct Classifier {
         if ["telegram", "whatsapp", "discord", "mobilesms", "slack", "larksuite", "mail", "signal", "messenger", "mobilephone"].contains(where: app.contains) { return .messaging }
         if ["quicktime", "vlc", "iina", "com.apple.preview", "finalcut", "davinci", "capcut", "premiere", "aftereffects", "imovie", "lumafusion", "motionapp", "spotify"].contains(where: app.contains) { return .preview }
         if ["browser", "chrome", "safari", "firefox", "orion", "microsoft.edgemac", "brave", "vivaldi", "operasoftware", "zen-browser"].contains(where: app.contains) || appName.lowercased() == "arc" { return .browser }
-        return .desktop
+        return nil
     }
 }
 
@@ -856,20 +1066,80 @@ struct ZoneRect: Codable, Equatable {
     init(_ rect: CGRect) { x = rect.minX; y = rect.minY; width = rect.width; height = rect.height }
     var cgRect: CGRect { CGRect(x: x, y: y, width: width, height: height) }
 }
+// The grid editor has the shape of the display it arranges: as wide as the
+// Lanes window allows, and narrower rather than taller than maxHeight.
+enum GridPreviewSize {
+    static func fit(width: Double, display: CGSize, maxHeight: Double = 470) -> CGSize {
+        guard width > 0, display.width > 0, display.height > 0 else { return CGSize(width: max(0, width), height: 330) }
+        let aspect = display.width / display.height
+        let height = min(maxHeight, width / aspect)
+        return CGSize(width: height * aspect, height: height)
+    }
+}
 struct GridGeometry {
-    static func valid(_ rects: [String: ZoneRect], lanes: [Lane]) -> Bool {
-        let values = lanes.compactMap { rects[$0.rawValue]?.cgRect }
+    // Every region inside the display; regions in the grid never overlap.
+    // Floating categories may sit over anything.
+    static func valid(_ rects: [String: ZoneRect], lanes: [Lane], floating: Set<String> = []) -> Bool {
+        let values = lanes.compactMap { lane in rects[lane.rawValue].map { (key: lane.rawValue, rect: $0.cgRect) } }
         guard values.count == lanes.count else { return false }
-        for (i, r) in values.enumerated() {
+        for (i, item) in values.enumerated() {
+            let r = item.rect
             guard [r.minX, r.minY, r.width, r.height].allSatisfy({ $0.isFinite }),
                   r.width >= 0.04 - 0.000001, r.height >= 0.06 - 0.000001, r.minX >= -0.000001, r.minY >= -0.000001,
                   r.maxX <= 1.000001, r.maxY <= 1.000001 else { return false }
-            for other in values.dropFirst(i + 1) {
-                let overlap = r.intersection(other)
+            guard !floating.contains(item.key) else { continue }
+            for other in values.dropFirst(i + 1) where !floating.contains(other.key) {
+                let overlap = r.intersection(other.rect)
                 if !overlap.isNull && overlap.width > 0.000001 && overlap.height > 0.000001 { return false }
             }
         }
         return true
+    }
+    // A category that starts floating leaves a hole in the grid. The neighbors
+    // that line one whole side of it grow into it, so a Browser beside a
+    // Terminal fills the screen. With no such side the hole stays.
+    static func filling(_ hole: CGRect, rects: [String: ZoneRect]) -> [String: ZoneRect] {
+        let e: CGFloat = 0.000001
+        for side in 0..<4 {
+            let vertical = side < 2
+            // 0: neighbors on the left grow right, 1: on the right grow left,
+            // 2: above grow down, 3: below grow up.
+            let touching = rects.filter { _, value in
+                let r = value.cgRect
+                let edge = side == 0 ? abs(r.maxX - hole.minX) : side == 1 ? abs(r.minX - hole.maxX) : side == 2 ? abs(r.maxY - hole.minY) : abs(r.minY - hole.maxY)
+                let low = vertical ? max(r.minY, hole.minY) : max(r.minX, hole.minX), high = vertical ? min(r.maxY, hole.maxY) : min(r.maxX, hole.maxX)
+                return edge < e && high - low > e
+            }
+            let inside = touching.values.allSatisfy { value in
+                let r = value.cgRect
+                return vertical ? r.minY >= hole.minY - e && r.maxY <= hole.maxY + e : r.minX >= hole.minX - e && r.maxX <= hole.maxX + e
+            }
+            let lined = touching.values.map { vertical ? $0.cgRect.height : $0.cgRect.width }.reduce(0, +)
+            guard !touching.isEmpty, inside, abs(lined - (vertical ? hole.height : hole.width)) < 0.0001 else { continue }
+            var result = rects
+            for (key, value) in touching {
+                var r = value.cgRect
+                switch side {
+                case 0: r.size.width = hole.maxX - r.minX
+                case 1: r.size.width = r.maxX - hole.minX; r.origin.x = hole.minX
+                case 2: r.size.height = hole.maxY - r.minY
+                default: r.size.height = r.maxY - hole.minY; r.origin.y = hole.minY
+                }
+                result[key] = ZoneRect(r)
+            }
+            return result
+        }
+        return rects
+    }
+    // One edge of a floating category, moved on its own, on the same snap grid.
+    static func resizedAlone(_ original: CGRect, edge: ResizeEdge, dx: Double, dy: Double, snap: Bool) -> CGRect {
+        func quantize(_ n: Double, _ steps: Double) -> Double { snap ? (n * steps).rounded() / steps : n }
+        var minX = Double(original.minX), maxX = Double(original.maxX), minY = Double(original.minY), maxY = Double(original.maxY)
+        if edge == .left { minX = min(maxX - 0.04, max(0, quantize(minX + dx, 32))) }
+        if edge == .right || edge == .bottomRight { maxX = max(minX + 0.04, min(1, quantize(maxX + dx, 32))) }
+        if edge == .top { minY = min(maxY - 0.06, max(0, quantize(minY + dy, 16))) }
+        if edge == .bottom || edge == .bottomRight { maxY = max(minY + 0.06, min(1, quantize(maxY + dy, 16))) }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
     static func edited(_ original: CGRect, dx: Double, dy: Double, resize: Bool, snap: Bool) -> CGRect {
         func quantize(_ n: Double, _ steps: Double) -> Double { snap ? (n * steps).rounded() / steps : n }
